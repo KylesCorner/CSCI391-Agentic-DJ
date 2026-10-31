@@ -246,8 +246,8 @@ class ListenBrainz:
              "recording_mbids": mbids_from_track(t)} for t in tracks[:100]
         ], "feedback": payload.get("feedback", [])}
 
-    def playlists(self, count=20) -> dict:
-        return self.get(f"user/{self.user}/playlists", {"count": count})
+    def playlists(self, count=20, offset=0) -> dict:
+        return self.get(f"user/{self.user}/playlists", {"count": count, "offset": offset})
 
     def playlist(self, mbid: str) -> dict:
         return self.get(f"playlist/{check_uuid(mbid)}")
@@ -263,8 +263,45 @@ class ListenBrainz:
     def create_playlist(self, title: str, mbids: list[str]) -> dict:
         return self.post("playlist/create", self.jspf(title, mbids, public=False))
 
-    def add_tracks(self, playlist_mbid: str, mbids: list[str]) -> dict:
-        return self.post(f"playlist/{check_uuid(playlist_mbid)}/item/add", self.jspf("", mbids))
+
+    def add_tracks(
+        self,
+        playlist_mbid: str,
+        mbids: list[str],
+    ) -> dict:
+        """
+        Append recordings to an existing ListenBrainz playlist.
+
+        The add endpoint requires a JSPF playlist object
+        containing tracks, but no playlist title is needed.
+        """
+
+        playlist_id = check_uuid(playlist_mbid)
+
+        if not mbids:
+            raise ValueError(
+                "Cannot add an empty list of recordings"
+            )
+
+        body = {
+            "playlist": {
+                "track": [
+                    {
+                        "identifier": [
+                            "https://musicbrainz.org/recording/"
+                            + check_uuid(mbid)
+                        ]
+                    }
+                    for mbid in mbids
+                ]
+            }
+        }
+
+        return self.post(
+            f"playlist/{playlist_id}/item/add",
+            body,
+        )
+
 
     def remove_tracks(self, playlist_mbid: str, index: int, count: int) -> dict:
         return self.post(f"playlist/{check_uuid(playlist_mbid)}/item/delete", {"index": index, "count": count})
