@@ -60,7 +60,7 @@ SPECS = [
     spec("verify_recordings", "Resolve MBIDs in MusicBrainz before writing a playlist", {"mbids": arr("Recording UUIDs")}, ("mbids",)),
     spec("lb_radio", "Discover related recordings via LB Radio; use well-formed artist:(Benny Goodman) or tag:(swing) expressions, NOT natural-language questions", {"prompt": s("LB Radio prompt"), "mode": {"type": "string", "enum": ["easy", "medium", "hard"]}}, ("prompt",)),
     spec("get_recommendations", "Retrieve ListenBrainz collaborative recommendations", {"count": n("Number", 1, 100)}),
-    spec("select_playlist_duration", "Select subset of verified recordings and report ready=true only if within 60 seconds of target. If ready=false, search and verify MORE recordings. Never create a shorter playlist.", {"mbids": arr("Verified recording MBIDs"), "target_minutes": n("Target duration in minutes", 1, 180)}, ("mbids", "target_minutes")),
+    spec("select_playlist_duration", "Select exactly the ORIGINAL requested number of verified recordings closest to the ORIGINAL duration target. ready=true ONLY when BOTH count and duration (+/-60 s) pass; if false search and verify MORE candidates. Never create an incomplete playlist.", {"mbids": arr("Verified recording MBIDs"), "target_minutes": n("Target duration in minutes", 1, 180)}, ("mbids", "target_minutes")),
     spec("list_playlists", "List own ListenBrainz playlists", {}),
     spec("get_playlist", "Read a playlist by MBID", {"playlist_mbid": s("Playlist UUID")}, ("playlist_mbid",)),
     spec("filter_recent_candidates", "Filter latest LB Radio candidates against scrobbles from last N days, using MBID or artist/title; only succeeds if history complete", {"days": n("Days to exclude", 1, 30)}, ("days",)),
@@ -102,6 +102,7 @@ class Tools:
         self.last_candidates: list[dict] = []
         self.recent_cache: dict[int, dict] = {}
         self.searched_recordings: dict[str, dict] = {}
+        self.last_duration_result: dict | None = None
 
     def _recent(self, days: int) -> dict:
         if days not in self.recent_cache:
@@ -259,6 +260,13 @@ class Tools:
                 self.goal, re.I,
             )
         if not match:
+            match = re.search(
+                r"\b(?:find|select|choose)\s+\d{1,2}\s+(?:distinct\s+)?"
+                r"(?P<artist>[\w&'’.-]+(?:\s+[\w&'’.-]+){0,4}?)\s+"
+                r"(?:recordings?|songs?|tracks?)\b",
+                self.goal, re.I,
+            )
+        if not match:
             by = re.search(r"\bby\s+(.+?)\s+to\s+(?:my\s+)?", self.goal, re.I)
             if by:
                 artist = by.group(1).strip()
@@ -268,6 +276,22 @@ class Tools:
         if self._is_generic_music_descriptor(artist):
             return None
         return artist
+
+    def _requested_playlist_track_count(self) -> int | None:
+        """Number of tracks explicitly required by the ORIGINAL playlist goal.
+
+        Never infer the number from a model-selected subset. Read-only
+        recommendations are handled separately in the agent.
+        """
+        if not re.search(r"\bplaylist\b", self.goal, re.I):
+            return None
+        match = re.search(
+            r"\b(\d{1,2})\s+(?:[\w-]+\s+){0,5}(?:songs?|tracks?|recordings?)\b",
+            self.goal, re.I,
+        )
+        if not match:
+            match = re.search(r"\b(\d{1,2})\s*[- ]\s*track\s+playlist\b", self.goal, re.I)
+        return int(match.group(1)) if match else None
 
     def _requested_duration_minutes(self) -> int | None:
         """Read a numeric minute requirement from the original user goal.
@@ -464,39 +488,104 @@ class Tools:
     def tool_get_recommendations(self, count=20): return self.lb.recommendations(count)
 
     def tool_select_playlist_duration(self, mbids, target_minutes):
+        """Choose real verified recordings jointly satisfying count and duration.
+
+        This is a bounded, deterministic exact-count subset sum over
+        whole-second durations (for candidate ranking). The write operation
+        independently revalidates exact millisecond durations and count.
+        """
+        requested_minutes = self._requested_duration_minutes()
+        if requested_minutes is not None and requested_minutes != target_minutes:
+            raise ServiceError(
+                "invalid",
+                f"The user requested {requested_minutes} minutes, not {target_minutes}. "
+                "Use the ORIGINAL user's target; do not relax it.",
+            )
+
         cleaned = self._verified_mbids(mbids)
-        duration_seconds = {}
+        required_count = self._requested_playlist_track_count()
+        lengths: dict[str, int] = {}
         omitted = []
         for mbid in cleaned:
             length = self.verified[mbid].get("duration_ms")
             if not isinstance(length, int) or length <= 0:
                 omitted.append(mbid)
             else:
-                duration_seconds[mbid] = max(1, round(length / 1000))
-        if not duration_seconds:
+                lengths[mbid] = max(1, round(length / 1000))
+        if not lengths:
             raise ServiceError("resource", "No verified tracks have known durations")
-        target = target_minutes * 60
-        # Deterministic bounded subset-sum; never substitute guessed durations.
-        states = {0: ()}
-        for mbid, seconds in duration_seconds.items():
-            for total, subset in list(states.items()):
-                new_total = total + seconds
-                if new_total <= target + 180 and new_total not in states:
-                    states[new_total] = subset + (mbid,)
-        best = min((x for x in states if x > 0), key=lambda x: (abs(target - x), x > target))
-        ready = abs(best - target) <= 60
-        return {"mbids": list(states[best]), "minutes": round(best / 60, 2),
-                "target_minutes": target_minutes, "difference_seconds": best - target,
-                "ready": ready, "remaining_seconds": max(0, target - best),
-                "omitted_unknown_length": omitted,
-                "note": (
-                    "Selection is within +/-1 minute of the target. "
-                    "Instrumental status is not validated by duration."
-                    if ready else
-                    "NOT READY: too far from the requested duration. "
-                    "Search for additional songs, verify their MBIDs, then "
-                    "select_playlist_duration again. DO NOT create a shorter playlist."
-                )}
+
+        target_s = target_minutes * 60
+        # Bound the sum space while allowing a diagnostic answer when all
+        # count-feasible subsets are a few minutes longer than requested.
+        upper_s = target_s + 600
+        max_count = required_count if required_count is not None else len(lengths)
+        states: list[dict[int, tuple[str, ...]]] = [dict() for _ in range(max_count + 1)]
+        states[0][0] = ()
+        for mbid, seconds in lengths.items():
+            for count in range(max_count - 1, -1, -1):
+                for total, subset in list(states[count].items()):
+                    new_total = total + seconds
+                    if new_total <= upper_s and new_total not in states[count + 1]:
+                        states[count + 1][new_total] = subset + (mbid,)
+
+        if required_count is not None:
+            pool = states[required_count]
+            if not pool:
+                missing = max(0, required_count - len(lengths))
+                result = {
+                    "mbids": [], "minutes": None, "target_minutes": target_minutes,
+                    "required_track_count": required_count, "selected_track_count": 0,
+                    "ready": False, "difference_seconds": None,
+                    "omitted_unknown_length": omitted,
+                    "note": (
+                        f"NOT READY: Need {required_count} recordings with known lengths; "
+                        f"have {len(lengths)}. " +
+                        (f"Find at least {missing} more recordings, " if missing else
+                         "Current count-feasible selections are too long; find shorter recordings, ") +
+                        "verify them, then run select_playlist_duration again. "
+                        "No playlist may be created."
+                    ),
+                }
+                self.last_duration_result = result
+                return result
+        else:
+            pool = {
+                total: subset for count, level in enumerate(states)
+                if count > 0 for total, subset in level.items()
+            }
+
+        best_s = min(pool, key=lambda x: (abs(x - target_s), x > target_s, x))
+        selected = list(pool[best_s])
+        exact_ms = sum(self.verified[mbid]["duration_ms"] for mbid in selected)
+        difference_s = round((exact_ms - target_s * 1000) / 1000)
+        ready = abs(exact_ms - target_s * 1000) <= 60_000 and (
+            required_count is None or len(selected) == required_count
+        )
+        actual_minutes = round(exact_ms / 60_000, 2)
+        fmt = self._duration_string(exact_ms)
+        message = (
+            "READY: both original track count and duration constraints are met. "
+            if ready else
+            f"NOT READY: closest {len(selected)}-track selection totals {fmt}; "
+            f"target is {target_minutes}:00 (+/-1:00). "
+            "Search and verify additional recordings with suitable durations, "
+            "then select again; do NOT create the playlist. "
+        )
+        result = {
+            "mbids": selected,
+            "minutes": actual_minutes,
+            "target_minutes": target_minutes,
+            "required_track_count": required_count,
+            "selected_track_count": len(selected),
+            "difference_seconds": difference_s,
+            "ready": ready,
+            "remaining_seconds": max(0, -difference_s),
+            "omitted_unknown_length": omitted,
+            "note": message + "Instrumental status is not validated by duration.",
+        }
+        self.last_duration_result = result
+        return result
 
     def tool_list_playlists(self): return self.lb.playlists()
     def tool_get_playlist(self, playlist_mbid): return self.lb.playlist(playlist_mbid)
@@ -555,12 +644,13 @@ class Tools:
             )
 
         # Check the requested track count *before* any approval or POST.
-        expected = re.search(
-            r"\b(\d{1,2})\s+(?:[\w-]+\s+){0,5}(?:songs?|tracks?|recordings?)\b",
-            self.goal, re.IGNORECASE
-        )
-        if expected and len(cleaned) != int(expected.group(1)):
-            raise ServiceError("invalid", f"User requested {expected.group(1)} recordings, got {len(cleaned)}")
+        expected_count = self._requested_playlist_track_count()
+        if expected_count is not None and len(cleaned) != expected_count:
+            raise ServiceError(
+                "invalid",
+                f"User requested {expected_count} recordings, got {len(cleaned)}. "
+                "Do not create a playlist until BOTH track count and duration match.",
+            )
 
         if exclude_days:
             candidates = [{"recording_mbids": [mbid],

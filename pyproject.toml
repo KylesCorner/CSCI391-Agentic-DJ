@@ -8,6 +8,7 @@ dependencies = [
   "python-dotenv>=1.0,<2",
   "jsonschema>=4.23,<5",
   "ytmusicapi>=1.12.3",
+  "chromadb>=1,<2",
 ]
 
 [project.optional-dependencies]

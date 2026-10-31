@@ -263,45 +263,20 @@ class ListenBrainz:
     def create_playlist(self, title: str, mbids: list[str]) -> dict:
         return self.post("playlist/create", self.jspf(title, mbids, public=False))
 
-
-    def add_tracks(
-        self,
-        playlist_mbid: str,
-        mbids: list[str],
-    ) -> dict:
-        """
-        Append recordings to an existing ListenBrainz playlist.
-
-        The add endpoint requires a JSPF playlist object
-        containing tracks, but no playlist title is needed.
-        """
-
+    def add_tracks(self, playlist_mbid: str, mbids: list[str]) -> dict:
+        """Append verified recording MBIDs using JSPF without an empty title."""
         playlist_id = check_uuid(playlist_mbid)
-
         if not mbids:
-            raise ValueError(
-                "Cannot add an empty list of recordings"
-            )
-
+            raise ValueError("Cannot add an empty list of recordings")
         body = {
             "playlist": {
                 "track": [
-                    {
-                        "identifier": [
-                            "https://musicbrainz.org/recording/"
-                            + check_uuid(mbid)
-                        ]
-                    }
+                    {"identifier": [f"https://musicbrainz.org/recording/{check_uuid(mbid)}"]}
                     for mbid in mbids
                 ]
             }
         }
-
-        return self.post(
-            f"playlist/{playlist_id}/item/add",
-            body,
-        )
-
+        return self.post(f"playlist/{playlist_id}/item/add", body)
 
     def remove_tracks(self, playlist_mbid: str, index: int, count: int) -> dict:
         return self.post(f"playlist/{check_uuid(playlist_mbid)}/item/delete", {"index": index, "count": count})
@@ -328,7 +303,7 @@ class MusicBrainz:
         finally:
             self.http.user_agent = old
 
-    def search(self, query: str, limit=10) -> dict:
+    def search(self, query: str, limit=30) -> dict:
         return self.get("recording", {"query": query, "limit": limit})
 
     def search_artist(self, query: str, limit=10) -> dict:

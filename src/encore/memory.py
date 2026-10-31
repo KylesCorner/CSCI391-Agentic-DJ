@@ -7,6 +7,7 @@ import json
 import re
 import sqlite3
 import uuid
+import shutil
 
 
 def utc_now() -> str:
@@ -72,6 +73,29 @@ class Memory:
         """)
         self.db.commit()
 
+    def enable_episodic(self, store):
+        """Opt in to Chroma-backed episodic retrieval; leave other SQLite stores intact."""
+        self.episodic = store
+
+    def add_structured_session(self, goal: str, summary: dict, outcome: str, quality: dict) -> dict:
+        if not getattr(self, "episodic", None):
+            raise RuntimeError("Episodic Chroma store was not initialized")
+        return self.episodic.add(goal, summary, outcome, quality)
+
+    def _working_archive_dir(self) -> Path:
+        user = getattr(getattr(self, "episodic", None), "user_id", "local")
+        # User-scoped directory, without embedding the account name in a path.
+        return self.path.parent / "working_archives" / hashlib.sha256(user.encode()).hexdigest()[:20]
+
+    def archive_working_messages(self, session_id: str, messages: list[dict]) -> None:
+        directory = self._working_archive_dir()
+        directory.mkdir(parents=True, exist_ok=True)
+        # IDs are generated locally by the tool executor, not by the LLM.
+        filename = directory / (str(uuid.UUID(session_id)) + ".jsonl")
+        with filename.open("a", encoding="utf-8") as f:
+            f.write(json.dumps({"ts": utc_now(), "messages": messages},
+                               ensure_ascii=False, default=str) + "\n")
+
     def close(self):
         self.db.close()
 
@@ -87,6 +111,8 @@ class Memory:
         self.db.commit()
 
     def search_sessions(self, query: str, limit=5) -> list[dict]:
+        if getattr(self, "episodic", None) is not None:
+            return self.episodic.search(query, limit=limit)
         q = fts_query(query)
         if not q:
             return []
@@ -153,7 +179,16 @@ class Memory:
         self.db.commit()
 
     def delete_personal(self):
-        """Delete all locally saved personal data, writes, and indexed knowledge."""
+        """Delete local SQLite data and the current user's Chroma episodes."""
+        deleted = {}
+        if getattr(self, "episodic", None) is not None:
+            deleted["episodic_chroma"] = self.episodic.delete_user()
         for table in ("sessions", "preferences", "knowledge", "writes"):
+            deleted[table] = self.db.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
             self.db.execute(f"DELETE FROM {table}")
         self.db.commit()
+        archive_dir = self._working_archive_dir()
+        deleted["working_archives"] = len(list(archive_dir.glob("*.jsonl"))) if archive_dir.exists() else 0
+        if archive_dir.exists():
+            shutil.rmtree(archive_dir)
+        return deleted
