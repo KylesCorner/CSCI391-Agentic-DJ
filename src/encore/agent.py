@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, asdict
+from pathlib import Path
 import re
 import json
 import time
@@ -14,6 +15,8 @@ import random
 
 from .tools import Tools, SPECS, INDEX, WRITE_ACTIONS
 from .working_memory import maybe_compress
+from .router import DOMAIN_SCHEMA, DOMAINS, validate_domains, tools_for_domains, TOOL_DOMAIN
+from jsonschema import validate as schema_validate, ValidationError as SchemaValidationError
 
 
 # ============================================================
@@ -83,6 +86,15 @@ COMPLETION:
 """
 
 
+# The versioned file is the canonical procedural memory in a source checkout.
+# Wheels installed without a project-root prompts/ folder retain a safe fallback.
+PROMPT_VERSION = "system_v1"
+_prompt_file = Path(__file__).resolve().parents[2] / "prompts" / f"{PROMPT_VERSION}.md"
+if _prompt_file.is_file():
+    _versioned_system = _prompt_file.read_text(encoding="utf-8")
+    if _versioned_system.strip() and len(_versioned_system.split()) <= 700:
+        SYSTEM = _versioned_system
+
 # ============================================================
 # RESULT STRUCTURE
 # ============================================================
@@ -96,6 +108,8 @@ class RunResult:
     prompt_tokens: int
     generated_tokens: int
     tool_trace: list[dict]
+    confidence: str = "low"
+    sources: list[str] | None = None
 
 
 # ============================================================
@@ -103,10 +117,84 @@ class RunResult:
 # ============================================================
 
 class Ollama:
-    def __init__(self, host: str, model: str, summary_model: str | None = None):
+    def __init__(self, host: str, model: str, summary_model: str | None = None,
+                 *, cheap_model: str | None = None, final_model: str | None = None,
+                 router_model: str | None = None):
         self.host = host.rstrip("/")
-        self.model = model
-        self.summary_model = summary_model or model
+        self.model = cheap_model or model
+        self.final_model = final_model or model
+        self.summary_model = summary_model or self.model
+        self.router_model = router_model or self.summary_model
+
+    def route_domains(self, goal: str) -> tuple[tuple[str, ...], dict]:
+        """Force schema-constrained domain classification through Ollama's `format`."""
+        response = requests.post(
+            f"{self.host}/api/chat",
+            json={
+                "model": self.router_model,
+                "messages": [
+                    {"role": "system", "content": (
+                        "Classify the music assistant request into the needed tool domains. "
+                        "Allowed: listening (scrobbles, stats, feedback, releases); "
+                        "catalog (artist/recording metadata and verification); "
+                        "discovery (music suggestions/duration); "
+                        "library (playlists and edits); memory (earlier sessions, "
+                        "preferences, documentation); none (answer without tools). "
+                        "Select all relevant domains. Never interpret a question about "
+                        "how an export works as permission to export anything. "
+                        "Return ONLY a JSON object matching the supplied schema."
+                    )},
+                    {"role": "user", "content": goal},
+                ],
+                "format": DOMAIN_SCHEMA,
+                "stream": False, "think": False,
+                "options": {"temperature": 0, "num_predict": 160},
+            },
+            timeout=(5, 60),
+        )
+        response.raise_for_status()
+        payload = response.json()
+        domains = validate_domains(json.loads((payload.get("message") or {}).get("content") or "{}"))
+        return domains, {
+            "model": self.router_model,
+            "tokens_in": int(payload.get("prompt_eval_count") or 0),
+            "tokens_out": int(payload.get("eval_count") or 0),
+        }
+
+    def review_final(self, goal: str, proposed: dict, evidence: list[str]) -> tuple[dict, dict]:
+        """Expensive tier: structured, evidence-limited final response."""
+        schema = INDEX["final_answer"]["function"]["parameters"]
+        response = requests.post(
+            f"{self.host}/api/chat",
+            json={
+                "model": self.final_model,
+                "messages": [
+                    {"role": "system", "content": (
+                        "Finalize a music-agent answer using ONLY the supplied proposed "
+                        "answer and observed source identifiers. Never add recordings "
+                        "or claim an unobserved write. Preserve uncertainty and status. "
+                        "Return valid JSON matching the supplied schema."
+                    )},
+                    {"role": "user", "content": json.dumps({
+                        "original_request": goal, "proposed_final": proposed,
+                        "observed_sources": evidence[:30],
+                    }, ensure_ascii=False)},
+                ],
+                "format": schema,
+                "stream": False, "think": False,
+                "options": {"temperature": 0, "num_predict": 700},
+            },
+            timeout=(5, 120),
+        )
+        response.raise_for_status()
+        payload = response.json()
+        output = json.loads((payload.get("message") or {}).get("content") or "{}")
+        schema_validate(output, schema)
+        return output, {
+            "model": self.final_model,
+            "tokens_in": int(payload.get("prompt_eval_count") or 0),
+            "tokens_out": int(payload.get("eval_count") or 0),
+        }
 
     def summarize_working_memory(self, original_goal: str, earlier_turns: str) -> tuple[str, int, int]:
         """A bounded cheap-model call for rolling working-memory summaries."""
@@ -140,12 +228,13 @@ class Ollama:
         self,
         messages: list[dict],
         tools: list[dict],
+        *, tier: str = "cheap",
     ) -> dict:
-
+        selected_model = self.final_model if tier == "expensive" else self.model
         response = requests.post(
             f"{self.host}/api/chat",
             json={
-                "model": self.model,
+                "model": selected_model,
                 "messages": messages,
                 "tools": tools,
                 "stream": False,
@@ -765,10 +854,50 @@ def run_agent(
         },
     ]
 
-    available = route(goal)
+    # The model proposes domains; the rule-based gate *still* limits which
+    # account mutations can be executed. On routing failure all domains are
+    # considered, but the intent gate is never bypassed.
+    safety_available = route(goal)
+    selected_domains = tuple(DOMAINS[:-1])
+    router_fallback = True
+    router_meta: dict = {}
+    router_started = time.monotonic()
+    if callable(getattr(model, "route_domains", None)):
+        try:
+            selected_domains, router_meta = model.route_domains(goal)
+            selected_domains = validate_domains({"domains": list(selected_domains)})
+            router_fallback = False
+        except (requests.RequestException, ValueError, TypeError, KeyError, SchemaValidationError):
+            selected_domains = tuple(DOMAINS[:-1])
+    # Infer hard prerequisites from explicit user intent, not model guesses.
+    # This does NOT authorize a write because `route()` already scopes actions.
+    request_text = goal.casefold()
+    mandatory_domains = set()
+    if "playlist" in request_text and re.search(r"\b(?:create|make|build|save|add|remove|delete|export)\b", request_text):
+        mandatory_domains.add("library")
+    if "playlist" not in request_text and re.search(r"\b(?:mark|love|hate|unlove|unhate|clear|rate|thumbs up|thumbs down)\b", request_text) and re.search(r"\b(?:song|track|recording|feedback)\b", request_text):
+        mandatory_domains.update({"library", "catalog"})
+    if "playlist" in request_text and re.search(r"\b(?:create|make|build|save|add)\b", request_text):
+        mandatory_domains.add("catalog")
+    if any(phrase in request_text for phrase in ("previous session", "my preference", "previously", "last time")):
+        mandatory_domains.add("memory")
+    if mandatory_domains:
+        selected_domains = tuple(dict.fromkeys((*(d for d in selected_domains if d != "none"),
+                                               *sorted(mandatory_domains))))
+    elif selected_domains == ("none",) and len(safety_available) < len(SPECS):
+        # A known fact/tool workflow was misclassified as "none".
+        # Fall back to all domains, still subject to the existing intent gate.
+        selected_domains = tuple(DOMAINS[:-1])
+        router_fallback = True
+    available = tools_for_domains(safety_available, selected_domains)
+    # Keep required tools accessible if the classifier missed a domain:
+    # e.g. verified creation always requires catalog verification AND library.
+    if len(available) == 1 and len(safety_available) > 1 and selected_domains != ("none",):
+        available = safety_available
+        router_fallback = True
 
-    prompt_tokens = 0
-    generated_tokens = 0
+    prompt_tokens = int(router_meta.get("tokens_in") or 0)
+    generated_tokens = int(router_meta.get("tokens_out") or 0)
 
     trace: list[dict] = []
     retry_rng = random.Random(retry_seed)
@@ -777,9 +906,19 @@ def run_agent(
         if event_log is not None:
             event_log.emit(event, **fields)
 
-    _emit("route", allowed_tools=[spec["function"]["name"] for spec in available],
-          routing_strategy="rules", max_steps=max_steps,
-          model=getattr(model, "model", type(model).__name__), tier="single")
+    if router_meta:
+        _emit("llm_call", phase="routing", model=router_meta.get("model"), tier="cheap",
+              success=True, tokens_in=router_meta.get("tokens_in", 0),
+              tokens_out=router_meta.get("tokens_out", 0),
+              latency_ms=round((time.monotonic()-router_started)*1000))
+    _emit("route", prompt_version=PROMPT_VERSION,
+          allowed_tools=[spec["function"]["name"] for spec in available],
+          routing_strategy="ollama_schema" if not router_fallback else "all_domains_fallback_safety_scoped",
+          domains=list(selected_domains), router_fallback=router_fallback,
+          max_steps=max_steps, model=router_meta.get("model", getattr(model, "model", type(model).__name__)),
+          tier="cheap", tokens_in=router_meta.get("tokens_in", 0),
+          tokens_out=router_meta.get("tokens_out", 0),
+          latency_ms=round((time.monotonic()-router_started)*1000))
 
     def _record(item: dict):
         trace.append(item)
@@ -810,6 +949,7 @@ def run_agent(
     ] = {}
 
     verified_mbids: set[str] = set()
+    retrieved_knowledge_ids: set[str] = set()
 
     status = "budget_exceeded"
 
@@ -820,6 +960,8 @@ def run_agent(
 
     force_final = False
     consecutive_no_calls = 0
+    final_confidence = "low"
+    final_sources: list[str] = []
 
     # Episodic recall is a session-initialization read, not a model action.
     # Inject only the top 3 user-scoped summaries and explicitly mark staleness.
@@ -950,18 +1092,21 @@ def run_agent(
 
         llm_started = time.monotonic()
         try:
-            response = model.chat(
-                messages,
-                current_tools,
-            )
+            if isinstance(model, Ollama):
+                response = model.chat(messages, current_tools,
+                                      tier="expensive" if final_only else "cheap")
+            else:
+                response = model.chat(messages, current_tools)
 
         except (
             requests.RequestException,
             KeyError,
             ValueError,
         ) as exc:
-            _emit("llm_call", step=step, model=getattr(model, "model", type(model).__name__),
-                  tier="single", success=False,
+            _emit("llm_call", step=step,
+                  model=getattr(model, "final_model", model.model) if final_only and isinstance(model, Ollama)
+                        else getattr(model, "model", type(model).__name__),
+                  tier="expensive" if final_only else "cheap", success=False,
                   latency_ms=round((time.monotonic() - llm_started)*1000),
                   error_category="fatal")
             status = "stuck"
@@ -979,8 +1124,10 @@ def run_agent(
             response.get("eval_count") or 0
         )
 
-        _emit("llm_call", step=step, model=getattr(model, "model", type(model).__name__),
-              tier="single", success=True,
+        _emit("llm_call", step=step,
+              model=getattr(model, "final_model", model.model) if final_only and isinstance(model, Ollama)
+                    else getattr(model, "model", type(model).__name__),
+              tier="expensive" if final_only else "cheap", success=True,
               latency_ms=round((time.monotonic() - llm_started)*1000),
               tokens_in=int(response.get("prompt_eval_count") or 0),
               tokens_out=int(response.get("eval_count") or 0),
@@ -1182,6 +1329,16 @@ def run_agent(
 
             from jsonschema import validate, ValidationError
 
+            # Older local models sometimes omit metadata despite its being
+            # required in the advertised schema. Normalize conservatively and
+            # record the correction; never invent a source identifier.
+            missing_fields = [field for field in ("confidence", "sources") if field not in args]
+            if "confidence" not in args:
+                args["confidence"] = "low" if args.get("status") != "answered" else "medium"
+            if "sources" not in args:
+                args["sources"] = []
+            if missing_fields:
+                _emit("final_schema_normalized", step=step, missing=missing_fields)
             try:
                 validate(
                     args,
@@ -1219,6 +1376,8 @@ def run_agent(
 
             proposed_answer = args["answer"]
             proposed_status = args["status"]
+            final_confidence = args.get("confidence", "high" if proposed_status == "answered" else "low")
+            final_sources = list(args.get("sources") or [])
 
             # A successful catalog lookup is not a successful account write.
             requested_create = (
@@ -1266,8 +1425,7 @@ def run_agent(
                                         "could not be confirmed by readback. Reconcile the remote "
                                         "playlist before attempting another edit.")
 
-            if ("set_feedback" in {sp["function"]["name"] for sp in available}
-                    and re.search(r"\b(?:mark|set|love|hate|unlove|unhate|clear|remove|rate)\b", low_goal)
+            if (re.search(r"\b(?:mark|set|love|hate|unlove|unhate|clear|remove|rate)\b", low_goal)
                     and re.search(r"\b(?:song|track|recording|feedback|this)\b", low_goal)
                     and proposed_status == "answered"):
 
@@ -1396,8 +1554,82 @@ def run_agent(
                 force_final = True
                 continue
 
+            # The expensive tier reviews the *already guarded* final answer;
+            # do not accept new facts/claims that bypass grounding checks.
+            observed_ids = set(verified_mbids)
+            for item in trace:
+                if item.get("ok") and isinstance(item.get("playlist_mbid"), str):
+                    observed_ids.add(item["playlist_mbid"])
+            known_sources = list(sorted(observed_ids | retrieved_knowledge_ids))
+            for entry in grounded_candidates.values():
+                for mbid in entry.get("mbids", []):
+                    if isinstance(mbid, str):
+                        known_sources.append(mbid)
+            known_sources = list(dict.fromkeys(known_sources))
+            # Reconcile every user/model-supplied identifier with observations.
+            import uuid
+            def _trusted_source(source):
+                if not isinstance(source, str) or not source.strip():
+                    return False
+                try:
+                    uuid.UUID(source)
+                except ValueError:
+                    return (source in retrieved_knowledge_ids or
+                            (source.startswith("tool:") and source[5:] in {
+                                t.get("tool") for t in trace if t.get("ok")
+                            }))
+                else:
+                    return source in known_sources
+            final_sources = [x for x in final_sources if _trusted_source(x)]
+            if not final_sources:
+                # Cite only sources actually used in the composed answer.
+                # A verified candidate not mentioned in the answer is not cited.
+                normalized_final = _normalize(proposed_answer)
+                cited_recordings = []
+                for entry in grounded_candidates.values():
+                    if _normalize(entry["title"]) in normalized_final and _normalize(entry["artist"]) in normalized_final:
+                        cited_recordings.extend(x for x in entry["mbids"] if x in observed_ids)
+                successful_writes = [t.get("playlist_mbid") for t in trace
+                                     if t.get("ok") and t.get("playlist_mbid")]
+                final_sources = list(dict.fromkeys([
+                    *successful_writes, *cited_recordings,
+                    *sorted(retrieved_knowledge_ids),
+                ]))[:15]
+                if not final_sources:
+                    final_sources = ["tool:" + t["tool"] for t in trace
+                                     if t.get("ok") and t.get("tool") not in {"final_answer", "compress"}][-5:]
+            if callable(getattr(model, "review_final", None)) and not final_only:
+                final_started = time.monotonic()
+                try:
+                    reviewed, usage = model.review_final(goal, {
+                        "answer": proposed_answer, "status": proposed_status,
+                        "confidence": final_confidence, "sources": final_sources,
+                    }, known_sources)
+                    prompt_tokens += usage["tokens_in"]
+                    generated_tokens += usage["tokens_out"]
+                    _emit("llm_call", step=step, model=usage["model"], tier="expensive",
+                          success=True, phase="final_review",
+                          tokens_in=usage["tokens_in"], tokens_out=usage["tokens_out"],
+                          latency_ms=round((time.monotonic()-final_started)*1000))
+                    if (reviewed["status"] == proposed_status
+                        and not _answer_grounding_error(goal, reviewed["answer"], proposed_status,
+                                grounded_candidates, verified_mbids,
+                                positive_verification_claim(reviewed["answer"]))
+                        and not (positive_verification_claim(reviewed["answer"]) and not did_verify)):
+                        proposed_answer = reviewed["answer"]
+                        final_confidence = reviewed["confidence"]
+                        final_sources = [v for v in reviewed["sources"] if _trusted_source(v)] or final_sources
+                except (requests.RequestException, ValueError, TypeError, KeyError, SchemaValidationError) as exc:
+                    _emit("llm_call", step=step, model=getattr(model, "final_model", "unknown"),
+                          tier="expensive", success=False, phase="final_review",
+                          error_category=type(exc).__name__,
+                          latency_ms=round((time.monotonic()-final_started)*1000))
+                    # The validated cheap-tier answer remains an honest fallback.
+
             status = proposed_status
             answer = proposed_answer
+            if status != "answered" and final_confidence == "high":
+                final_confidence = "low"
 
             _record({
                 "step": step,
@@ -1481,6 +1713,10 @@ def run_agent(
             time.sleep(delay_used)
 
         if outcome.ok:
+            if name in {"search_music_knowledge", "search_knowledge"} and isinstance(outcome.data, list):
+                for chunk in outcome.data:
+                    if isinstance(chunk, dict) and isinstance(chunk.get("id"), str):
+                        retrieved_knowledge_ids.add(chunk["id"])
 
             _remember_candidates(
                 name,
@@ -1758,7 +1994,7 @@ def run_agent(
                         "without completing and confirming the requested write."
                     )
 
-    _emit("final", status=status, steps=sum(item.get("step", 0) > 0 and item.get("tool") != "compress" for item in trace),
+    _emit("final", status=status, confidence=final_confidence, sources=final_sources[:15], steps=sum(item.get("step", 0) > 0 and item.get("tool") != "compress" for item in trace),
           tokens_in=prompt_tokens, tokens_out=generated_tokens,
           latency_ms=round((time.monotonic() - start) * 1000))
     return RunResult(
@@ -1772,4 +2008,6 @@ def run_agent(
         prompt_tokens=prompt_tokens,
         generated_tokens=generated_tokens,
         tool_trace=trace,
+        confidence=final_confidence,
+        sources=final_sources,
     )

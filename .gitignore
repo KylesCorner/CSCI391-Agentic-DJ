@@ -13,3 +13,4 @@ wheels/
 # Build Files
 data/
 evals/
+traces/

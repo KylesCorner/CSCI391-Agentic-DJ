@@ -17,6 +17,9 @@ class Config:
     episodic_path: Path
     embedding_model: str
     summary_model: str
+    cheap_model: str = ""
+    final_model: str = ""
+    router_model: str = ""
 
 
 def get_config() -> Config:
@@ -32,5 +35,8 @@ def get_config() -> Config:
         user_id=os.getenv("ENCORE_USER_ID", os.getenv("LISTENBRAINZ_USER", "")).strip(),
         episodic_path=Path(os.getenv("ENCORE_EPISODIC_PATH", "./data/encore_chroma")),
         embedding_model=os.getenv("ENCORE_EMBED_MODEL", "nomic-embed-text").strip(),
-        summary_model=os.getenv("ENCORE_SUMMARY_MODEL", os.getenv("OLLAMA_MODEL", "qwen3-coder:30b")).strip(),
+        summary_model=os.getenv("ENCORE_SUMMARY_MODEL", os.getenv("ENCORE_CHEAP_MODEL", os.getenv("OLLAMA_MODEL", "qwen3-coder:30b"))).strip(),
+        cheap_model=os.getenv("ENCORE_CHEAP_MODEL", os.getenv("OLLAMA_MODEL", "qwen3-coder:30b")).strip(),
+        final_model=os.getenv("ENCORE_FINAL_MODEL", os.getenv("OLLAMA_MODEL", "qwen3-coder:30b")).strip(),
+        router_model=os.getenv("ENCORE_ROUTER_MODEL", os.getenv("ENCORE_CHEAP_MODEL", os.getenv("ENCORE_SUMMARY_MODEL", os.getenv("OLLAMA_MODEL", "qwen3-coder:30b")))).strip(),
     )

@@ -136,6 +136,8 @@ def main():
             )
             session_trace.emit("session_start", command="ask", max_steps=args.steps,
                                model=cfg.model, summary_model=cfg.summary_model,
+                               cheap_model=cfg.cheap_model, final_model=cfg.final_model,
+                               router_model=cfg.router_model,
                                embedding_model=cfg.embedding_model,
                                context_budget=args.context_budget,
                                injected=bool(injection))
@@ -175,7 +177,10 @@ def main():
 
         tools = Tools(lb, mb, mem, approve=traced_approval,
                       current_goal=goal, session_id=session_trace.session_id)
-        result = run_agent(goal, tools, Ollama(cfg.ollama_host, cfg.model, cfg.summary_model),
+        result = run_agent(goal, tools, Ollama(cfg.ollama_host, cfg.model, cfg.summary_model,
+                                              cheap_model=cfg.cheap_model,
+                                              final_model=cfg.final_model,
+                                              router_model=cfg.router_model),
                            max_steps=args.steps, trace_data=args.debug,
                            context_budget_tokens=args.context_budget,
                            event_log=session_trace,
@@ -217,7 +222,9 @@ def main():
                                error_category=type(exc).__name__)
             print(f"[episodic] Memory write FAILED: {type(exc).__name__}: {exc}")
         print(f"\n{result.answer}\n")
-        print(f"Status: {result.status} | actions: {result.steps} | seconds: {result.seconds}")
+        print(f"Status: {result.status} | confidence: {result.confidence} | actions: {result.steps} | seconds: {result.seconds}")
+        if result.sources:
+            print("Sources:", json.dumps(result.sources[:15], ensure_ascii=False))
         print(f"Ollama tokens: prompt={result.prompt_tokens}, generated={result.generated_tokens} (local, no API billing)")
         print("Tool trace:", json.dumps(result.tool_trace, indent=2))
         session_trace.emit("session_end", status=result.status,

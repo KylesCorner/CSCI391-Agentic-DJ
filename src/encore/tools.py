@@ -92,7 +92,14 @@ SPECS = [
     spec("remember_preference", "Remember only an EXPLICIT user preference quoted exactly from CURRENT request", {"key": s("Short key"), "value": s("Preference"), "evidence": s("Exact quote from this user request")}, ("key", "value", "evidence")),
     spec("note_preference", "WRITE session preference only when user explicitly states it in the CURRENT message. Include verbatim evidence, not text from APIs. Do NOT infer preferences from music recommendations.", {"key": s("Preference key"), "value": s("Preference value"), "evidence": s("Exact phrase from current user request")}, ("key", "value", "evidence")),
     spec("forget_preference", "Forget one saved preference", {"key": s("Saved preference key")}, ("key",)),
-    spec("final_answer", "Finish. Give truthful answer and status. Call only when done or unable to proceed", {"answer": s("Final explanation"), "status": {"type": "string", "enum": ["answered", "answered_low_confidence", "stuck"]}}, ("answer", "status")),
+    spec("final_answer", "Finish after completing the user goal or explaining why it cannot be completed. Provide status, evidence-based confidence and concrete source identifiers (MBIDs/playlist IDs/knowledge source labels); never invent citations.", {
+        "answer": s("Evidence-based final response"),
+        "status": {"type": "string", "enum": ["answered", "answered_low_confidence", "stuck"]},
+        "confidence": {"type": "string", "enum": ["high", "medium", "low"]},
+        "sources": {"type": "array", "items": {"type": "string", "minLength": 1},
+                    "maxItems": 30, "uniqueItems": True,
+                    "description": "Actual MBIDs, playlist IDs or retrieved knowledge-source identifiers; empty if no source"},
+    }, ("answer", "status", "confidence", "sources")),
 ]
 INDEX = {x["function"]["name"]: x for x in SPECS}
 WRITE_ACTIONS = frozenset({"create_playlist", "add_playlist_tracks", "remove_playlist_tracks", "add_playlist_items", "remove_playlist_items", "delete_playlist", "set_feedback", "export_playlist"})
