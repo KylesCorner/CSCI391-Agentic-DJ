@@ -54,7 +54,7 @@ RULES:
 - A musical descriptor such as "instrumental", "swing", or "study music" is NOT an artist name.
 - Instrumental status is not established by a title or MusicBrainz recording verification.
 - Saved preferences describe the user's constraints; do not mistake them for artist names.
-- Use search_knowledge for unfamiliar API behavior.
+- Use search_music_knowledge for API behavior and genre/mood terms; use search_past_sessions for past chats.
 - For "this month", use range=this_month.
 - For "this week", use range=this_week.
 - If listening-history coverage is incomplete, report it.
@@ -173,6 +173,45 @@ def route(goal: str) -> list[dict]:
 
     low = goal.casefold()
 
+    # Explanations of API behavior must never be routed to real account writes.
+    # The user saying "How does ... export ...?" is not authorization to export.
+    if re.search(r"^\s*(?:how does|how do|what is|what does|why does|explain|define)\b", low) and any(
+        term in low for term in (
+            "listenbrainz", "musicbrainz", "api", "jspf", "lb radio",
+            "rate limit", "scrobbl", "music glossary", "genre", "export",
+        )
+    ):
+        names = {"search_music_knowledge", "search_knowledge", "final_answer"}
+        return [sp for sp in SPECS if sp["function"]["name"] in names]
+
+    # Assignment-required read/write capabilities. Keep named operations
+    # isolated so the model cannot turn a read into an account mutation.
+    if re.search(r"\b(?:fresh|new|newest|latest|upcoming|recent)\s+releases?\b", low):
+        names = {"get_fresh_releases", "final_answer"}
+        return [sp for sp in SPECS if sp["function"]["name"] in names]
+
+    if re.search(r"\b(?:members?|membership|who(?:'s| is) in|played with|collaborat|lineup)\b", low) and        re.search(r"\b(?:band|quartet|trio|artist|musician|group|who)\b", low):
+        names = {"search_artists", "lookup_artist", "get_top_recordings_for_artist", "final_answer"}
+        return [sp for sp in SPECS if sp["function"]["name"] in names]
+
+    if re.search(r"\b(?:most popular|top recordings|top tracks|biggest songs)\b", low) and        re.search(r"\b(?:artist|by|for)\b", low):
+        names = {"search_artists", "get_top_recordings_for_artist", "final_answer"}
+        return [sp for sp in SPECS if sp["function"]["name"] in names]
+
+    if re.search(r"\b(?:feedback|loved|hated|liked|disliked)\b", low) and        re.search(r"\b(?:what|show|which|list|read|my)\b", low) and not re.search(r"\b(?:set|mark|clear|remove|change)\b", low):
+        names = {"get_feedback", "final_answer"}
+        return [sp for sp in SPECS if sp["function"]["name"] in names]
+
+    if re.search(r"\b(?:mark|set|love|hate|unlove|unhate|clear|remove|rate|thumbs up|thumbs down)\b", low) and        re.search(r"\b(?:song|track|recording|music|feedback|this)\b", low) and not "playlist" in low:
+        names = {"get_feedback", "search_recordings", "lookup_recording", "verify_recordings",
+                 "set_feedback", "final_answer"}
+        return [sp for sp in SPECS if sp["function"]["name"] in names]
+
+    # Whole-playlist deletion must never accidentally route to item removal.
+    if re.search(r"\b(?:delete|remove)\b", low) and re.search(r"\bplaylists?\b", low) and        not re.search(r"\b(?:song|track|recording|item)\b", low):
+        names = {"find_playlists", "get_playlist", "delete_playlist", "final_answer"}
+        return [sp for sp in SPECS if sp["function"]["name"] in names]
+
     write_intent = (
         any(
             word in low
@@ -254,12 +293,12 @@ def route(goal: str) -> list[dict]:
     if "playlist" in low and re.search(r"\b(add|append|insert)\b", low):
         names = {"list_playlists", "get_playlist", "search_recordings",
                  "search_artists", "verify_recordings", "lb_radio",
-                 "add_playlist_tracks", "final_answer"}
+                 "add_playlist_tracks", "add_playlist_items", "find_playlists", "final_answer"}
         return [sp for sp in SPECS if sp["function"]["name"] in names]
 
     if "playlist" in low and re.search(r"\b(remove|delete)\b", low):
-        names = {"list_playlists", "get_playlist", "remove_playlist_tracks",
-                 "final_answer"}
+        names = {"list_playlists", "find_playlists", "get_playlist", "remove_playlist_tracks",
+                 "remove_playlist_items", "final_answer"}
         return [sp for sp in SPECS if sp["function"]["name"] in names]
 
     # Limit first-time playlist creation to the domains actually needed.
@@ -268,7 +307,7 @@ def route(goal: str) -> list[dict]:
         names = {
             "search_recordings", "search_artists", "lb_radio",
             "verify_recordings", "get_recommendations",
-            "list_playlists", "get_playlist", "create_playlist",
+            "list_playlists", "find_playlists", "get_playlist", "create_playlist",
             "final_answer",
         }
         if memory_intent:
@@ -289,18 +328,18 @@ def route(goal: str) -> list[dict]:
     if memory_intent:
         names = {
             "recall_preferences", "search_past_sessions",
-            "remember_preference", "forget_preference", "final_answer",
+            "remember_preference", "note_preference", "forget_preference", "final_answer",
         }
         if discovery or "music" in low or "songs" in low or "tracks" in low:
             names |= {
                 "lb_radio", "search_artists", "search_recordings",
                 "lookup_recording", "verify_recordings",
-                "get_recommendations", "search_knowledge",
+                "get_recommendations", "search_knowledge", "search_music_knowledge",
             }
         if write_intent:
             names |= {
-                "list_playlists", "get_playlist", "create_playlist",
-                "add_playlist_tracks", "remove_playlist_tracks",
+                "list_playlists", "find_playlists", "get_playlist", "create_playlist",
+                "add_playlist_tracks", "add_playlist_items", "remove_playlist_tracks", "remove_playlist_items",
                 "export_playlist", "select_playlist_duration",
             }
         return [sp for sp in SPECS if sp["function"]["name"] in names]
@@ -315,10 +354,11 @@ def route(goal: str) -> list[dict]:
         names = {
             "search_artists",
             "search_recordings",
+            "lookup_artist", "get_top_recordings_for_artist",
             "lookup_recording",
             "verify_recordings",
             "lb_radio",
-            "search_knowledge",
+            "search_knowledge", "search_music_knowledge",
             "final_answer",
         }
 
@@ -365,10 +405,10 @@ def route(goal: str) -> list[dict]:
             "get_listen_count",
             "get_top_artists",
             "get_top_recordings",
-            "get_playing_now",
+            "get_playing_now", "get_feedback", "get_fresh_releases",
             "search_past_sessions",
             "recall_preferences",
-            "search_knowledge",
+            "search_knowledge", "search_music_knowledge",
             "final_answer",
         }
 
@@ -1159,21 +1199,33 @@ def run_agent(
             # does not prove a playlist is empty.
             requested_edit = None
             if "playlist" in low_goal and re.search(r"\b(add|append|insert)\b", low_goal):
-                requested_edit = "add_playlist_tracks"
+                requested_edit = {"add_playlist_tracks", "add_playlist_items"}
             elif "playlist" in low_goal and re.search(r"\b(remove|delete)\b", low_goal):
-                requested_edit = "remove_playlist_tracks"
+                if not re.search(r"\b(?:song|track|recording|item)\b", low_goal):
+                    requested_edit = {"delete_playlist"}
+                else:
+                    requested_edit = {"remove_playlist_tracks", "remove_playlist_items"}
             if requested_edit and proposed_status == "answered":
                 completed = [entry for entry in trace
-                             if entry.get("tool") == requested_edit and entry.get("ok")]
+                             if entry.get("tool") in requested_edit and entry.get("ok")]
                 if not completed:
                     proposed_status = "stuck"
-                    proposed_answer = (f"No {requested_edit} operation was confirmed by an API call. "
-                                       "The playlist was not reported as modified.")
+                    proposed_answer = ("No requested playlist operation was confirmed by an API call. "
+                                       "No modification may be claimed.")
                 elif not completed[-1].get("confirmed"):
                     proposed_status = "answered_low_confidence"
-                    proposed_answer += ("\n\nThe edit request was accepted, but its track list "
-                                        "could not be confirmed by readback. Inspect the playlist "
-                                        "before attempting another edit.")
+                    proposed_answer += ("\n\nThe write was accepted, but its outcome "
+                                        "could not be confirmed by readback. Reconcile the remote "
+                                        "playlist before attempting another edit.")
+
+            if ("set_feedback" in {sp["function"]["name"] for sp in available}
+                    and re.search(r"\b(?:mark|set|love|hate|unlove|unhate|clear|remove|rate)\b", low_goal)
+                    and re.search(r"\b(?:song|track|recording|feedback|this)\b", low_goal)
+                    and proposed_status == "answered"):
+
+                if not any(t.get("tool") == "set_feedback" and t.get("ok") for t in trace):
+                    proposed_status = "stuck"
+                    proposed_answer = "Recording feedback was not changed: no successful set_feedback call occurred."
 
             # A tool can verify that a recording exists, but not whether it
             # has vocals. Never mark an instrumental-only requirement as fully
@@ -1403,7 +1455,7 @@ def run_agent(
 
         if not outcome.ok:
             summary["message"] = outcome.message
-        if outcome.ok and name in {"create_playlist", "add_playlist_tracks", "remove_playlist_tracks"} and isinstance(outcome.data, dict):
+        if outcome.ok and name in {"create_playlist", "add_playlist_tracks", "remove_playlist_tracks", "add_playlist_items", "remove_playlist_items", "delete_playlist"} and isinstance(outcome.data, dict):
             summary["confirmed"] = bool(outcome.data.get("confirmed"))
             summary["playlist_mbid"] = outcome.data.get("playlist_mbid")
             for key in ("removed_index", "removed_count", "added", "track_count_observed"):

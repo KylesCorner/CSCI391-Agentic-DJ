@@ -246,6 +246,38 @@ class ListenBrainz:
              "recording_mbids": mbids_from_track(t)} for t in tracks[:100]
         ], "feedback": payload.get("feedback", [])}
 
+    def get_feedback(self, score: int | None = None, count: int = 25, offset: int = 0) -> dict:
+        """Read explicit ListenBrainz love/hate feedback, not recommendation feedback."""
+        if score not in (None, -1, 1):
+            raise ValueError("Feedback filter must be -1, 1, or omitted")
+        params = {"count": count, "offset": offset, "metadata": "true"}
+        if score is not None:
+            params["score"] = score
+        return self.get(f"feedback/user/{self.user}/get-feedback", params)
+
+    def set_feedback(self, recording_mbid: str, score: int) -> dict:
+        if score not in (-1, 0, 1):
+            raise ValueError("Feedback score must be -1, 0, or 1")
+        return self.post("feedback/recording-feedback", {
+            "recording_mbid": check_uuid(recording_mbid), "score": score,
+        })
+
+    def fresh_releases(self, days: int = 30, sort: str = "release_date") -> dict:
+        if not 1 <= days <= 90:
+            raise ValueError("days must be 1..90")
+        if sort not in {"release_date", "artist_credit_name", "release_name", "confidence"}:
+            raise ValueError("Invalid release sorting field")
+        return self.get(f"user/{self.user}/fresh_releases", {
+            "days": days, "sort": sort, "past": "true", "future": "true",
+        })
+
+    def top_recordings_for_artist(self, artist_mbid: str) -> dict:
+        return self.get(f"popularity/top-recordings-for-artist/{check_uuid(artist_mbid)}")
+
+    def delete_playlist(self, playlist_mbid: str) -> dict:
+        # Endpoint is POST /playlist/{mbid}/delete, not HTTP DELETE.
+        return self.post(f"playlist/{check_uuid(playlist_mbid)}/delete")
+
     def playlists(self, count=20, offset=0) -> dict:
         return self.get(f"user/{self.user}/playlists", {"count": count, "offset": offset})
 
@@ -308,6 +340,10 @@ class MusicBrainz:
 
     def search_artist(self, query: str, limit=10) -> dict:
         return self.get("artist", {"query": query, "limit": limit})
+
+    def lookup_artist(self, mbid: str) -> dict:
+        # artist-rels retrieves member-of-band / collaboration relationships.
+        return self.get(f"artist/{check_uuid(mbid)}", {"inc": "artist-rels"})
 
     def lookup(self, mbid: str) -> dict:
         return self.get(f"recording/{check_uuid(mbid)}")

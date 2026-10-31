@@ -73,6 +73,10 @@ class Memory:
         """)
         self.db.commit()
 
+    def enable_semantic(self, store):
+        """Route documentation queries to public ChromaDB semantic memory."""
+        self.semantic = store
+
     def enable_episodic(self, store):
         """Opt in to Chroma-backed episodic retrieval; leave other SQLite stores intact."""
         self.episodic = store
@@ -149,6 +153,8 @@ class Memory:
         return len(pieces)
 
     def search_knowledge(self, query: str, limit=5) -> list[dict]:
+        if getattr(self, "semantic", None) is not None:
+            return self.semantic.search(query, limit=limit, strategy="section", mode="hybrid")
         q = fts_query(query)
         if not q:
             return []

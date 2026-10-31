@@ -10,6 +10,7 @@ from .config import get_config
 from .memory import Memory
 from .episodic import EpisodicStore, OllamaEmbedder, SessionSummarizer, SUMMARY_FIELDS, _strip_secrets
 from .retrieval_eval import evaluate
+from .semantic import SemanticStore
 from .tools import Tools
 
 
@@ -38,6 +39,7 @@ def main():
     commands.add_parser("init-knowledge", help="Index trusted local documentation")
     ev = commands.add_parser("eval-retrieval", help="Evaluate semantic memory Recall@k")
     ev.add_argument("--k", type=int, default=3)
+    ev.add_argument("--output", default="evals/semantic_results.json", help="Write complete 3-way retrieval metrics as JSON")
     live_eval = commands.add_parser("eval-agent", help="Evaluate read-only prompts for latency/variance/tool choice")
     live_eval.add_argument("--repeats", type=int, default=3)
     commands.add_parser("delete-data", help="Delete local Encore memories/write logs")
@@ -50,6 +52,12 @@ def main():
     cfg = get_config()
     mem = Memory(cfg.db)
     mem.prune(days=90)
+    # Public semantic knowledge is independent from user-scoped episodic memory.
+    # Keep the collection separate even when the same Chroma directory is used.
+    if args.command in {"ask", "init-knowledge", "eval-retrieval"}:
+        mem.enable_semantic(SemanticStore(
+            cfg.episodic_path, OllamaEmbedder(cfg.ollama_host, cfg.embedding_model)
+        ))
     # For ask/episodes/deletion use the real user-scoped Chroma store.
     if args.command in {"ask", "episodes", "prune-episodes", "delete-data", "forget"}:
         store = EpisodicStore(
@@ -61,17 +69,23 @@ def main():
             store.prune()
     try:
         if args.command == "init-knowledge":
-            kb = Path(__file__).resolve().parents[2] / "knowledge" / "listenbrainz.md"
-            if not kb.exists():
-                kb = Path("knowledge/listenbrainz.md")
-            n = mem.ingest("listenbrainz-api", kb.read_text())
-            print(f"Indexed {n} knowledge chunks from {kb}")
+            corpus = Path(__file__).resolve().parents[2] / "knowledge"
+            if not corpus.is_dir():
+                corpus = Path("knowledge")
+            report = mem.semantic.index(corpus)
+            print(json.dumps(report, indent=2))
             return
         if args.command == "eval-retrieval":
             path = Path(__file__).resolve().parents[2] / "evals" / "retrieval_questions.json"
             if not path.exists():
                 path = Path("evals/retrieval_questions.json")
-            print(json.dumps(evaluate(mem, path, args.k), indent=2))
+            report = evaluate(mem, path, args.k)
+            output_path = Path(args.output)
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            output_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
+            print(json.dumps({"report":str(output_path),
+                              "recall_at_k":{k:v["recall_at_k"] for k,v in report["strategies"].items()},
+                              "n":report["question_count"],"k":args.k},indent=2))
             return
         if args.command == "prune-episodes":
             when = datetime.fromisoformat(args.now.replace("Z", "+00:00")) if args.now else datetime.now(timezone.utc)

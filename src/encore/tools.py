@@ -37,6 +37,18 @@ SPECS = [
     spec("get_top_recordings", "Top songs; this_month means CURRENT calendar month, month means PREVIOUS month. Falls back to counting current-month scrobbles if aggregated stats are unavailable.", {"count": n("Max results", 1, 50), "range": {"type": "string", "enum": ["this_week", "this_month", "this_year", "week", "month", "quarter", "year", "half_yearly", "all_time"]}}),
     spec("get_playing_now", "Currently playing track", {}),
 
+    spec("get_feedback", "READ explicit loved/hated recordings. Use for questions about user's likes/dislikes; do NOT use for writing feedback or API documentation.", {
+        "score": {"type": "integer", "enum": [-1, 1], "description": "Optional: 1 loved, -1 hated; omit for both"},
+        "count": n("Number of feedback entries", 1, 100),
+        "offset": n("Pagination offset", 0, 10000),
+    }),
+    spec("lookup_artist", "READ MusicBrainz artist MBID and artist relationships (including band membership). First search_artists if the MBID is unknown. Do NOT use for recording metadata or writes.", {"mbid": s("MusicBrainz artist UUID")}, ("mbid",)),
+    spec("get_top_recordings_for_artist", "READ most popular recordings for an artist MBID from ListenBrainz. Use search_artists first if MBID unknown; do NOT confuse artist MBID with recording MBID.", {"artist_mbid": s("MusicBrainz artist UUID")}, ("artist_mbid",)),
+    spec("get_fresh_releases", "READ upcoming/new releases relevant to this ListenBrainz user. Use for new-releases questions, NOT for all-time discography or creating a playlist.", {
+        "days": n("Days of releases", 1, 90),
+        "sort": {"type": "string", "enum": ["release_date", "artist_credit_name", "release_name", "confidence"]},
+    }),
+
     spec(
         "search_recordings",
         "Search MusicBrainz recordings. "
@@ -62,21 +74,28 @@ SPECS = [
     spec("get_recommendations", "Retrieve ListenBrainz collaborative recommendations", {"count": n("Number", 1, 100)}),
     spec("select_playlist_duration", "Select exactly the ORIGINAL requested number of verified recordings closest to the ORIGINAL duration target. ready=true ONLY when BOTH count and duration (+/-60 s) pass; if false search and verify MORE candidates. Never create an incomplete playlist.", {"mbids": arr("Verified recording MBIDs"), "target_minutes": n("Target duration in minutes", 1, 180)}, ("mbids", "target_minutes")),
     spec("list_playlists", "List own ListenBrainz playlists", {}),
+    spec("find_playlists", "READ the user's playlist list, including private playlists (token required). Use to resolve a playlist name before editing; do NOT infer tracks from the listing or write anything.", {}),
     spec("get_playlist", "Read a playlist by MBID", {"playlist_mbid": s("Playlist UUID")}, ("playlist_mbid",)),
     spec("filter_recent_candidates", "Filter latest LB Radio candidates against scrobbles from last N days, using MBID or artist/title; only succeeds if history complete", {"days": n("Days to exclude", 1, 30)}, ("days",)),
     spec("create_playlist", "Requires BOTH title (string) and mbids (list of verified UUIDs). Example: {title: Swing Test, mbids: [five verified recording IDs]}. CREATE a PRIVATE ListenBrainz playlist ONLY if the user explicitly requested creation. Verify all recording MBIDs first. Do not call more than once. Checks existing titles, requests human approval, and confirms the resulting tracks; include the created playlist MBID in final_answer. Do not use for read-only recommendations.", {"title": s("Title"), "mbids": arr("Verified recording MBIDs"), "exclude_days": n("Optional days to exclude", 0, 30)}, ("title", "mbids")),
     spec("add_playlist_tracks", "APPEND verified, non-duplicate recordings to an EXISTING playlist only when user said add; read actual playlist first, validate title, request approval, verify readback. Never create a new playlist.", {"playlist_mbid": s("Playlist UUID"), "mbids": arr("Verified recording MBIDs")}, ("playlist_mbid", "mbids")),
     spec("remove_playlist_tracks", "REMOVE tracks only from an EXISTING playlist if the user asked to remove; for 'last song', index argument is ignored and safely derived from full playlist detail; approval shows the exact selected track, then verifies readback. Never infer positions from list_playlists.", {"playlist_mbid": s("Playlist UUID"), "index": n("Zero-based index", 0, 100000), "count": n("Tracks to remove", 1, 40)}, ("playlist_mbid", "index", "count")),
+    spec("add_playlist_items", "WRITE append verified MBIDs to an existing playlist after user approval. The user must explicitly request adding; use find_playlists/get_playlist first. Do NOT create a new playlist or add duplicates.", {"playlist_mbid": s("Existing playlist UUID"), "mbids": arr("Verified recording MBIDs")}, ("playlist_mbid", "mbids")),
+    spec("remove_playlist_items", "WRITE remove from existing playlist with approval and full detail readback. Last/first are resolved from actual tracks. Do NOT use for whole-playlist deletion.", {"playlist_mbid": s("Existing playlist UUID"), "index": n("Zero-based track position", 0, 100000), "count": n("Tracks to remove", 1, 40)}, ("playlist_mbid", "index", "count")),
+    spec("delete_playlist", "DESTRUCTIVE WRITE: delete an ENTIRE existing playlist, ONLY if its title starts '[Encore]' and its owner is the current user. Requires explicit current-request deletion intent and human approval. Do NOT use to remove tracks or delete non-Encore playlists. Reconcile failed/uncertain writes instead of retrying.", {"playlist_mbid": s("Existing Encore-created playlist UUID")}, ("playlist_mbid",)),
+    spec("set_feedback", "WRITE one recording's explicit ListenBrainz love/hate/clear feedback; 1=love, -1=hate, 0=clear. Get recording MBID from search/verify first, and request human approval. Do NOT use for fetching feedback or for vague pronouns without a recording.", {"recording_mbid": s("Verified recording UUID"), "score": {"type": "integer", "enum": [-1, 0, 1]}}, ("recording_mbid", "score")),
     spec("export_playlist", "EXPORT to connected Spotify/Apple Music, with user approval", {"playlist_mbid": s("Playlist UUID"), "service": {"type": "string", "enum": ["spotify", "apple_music"]}}, ("playlist_mbid", "service")),
     spec("search_past_sessions", "Retrieve episodic memory for prior requests", {"query": s("Past-goal search")}, ("query",)),
-    spec("search_knowledge", "Retrieve indexed ListenBrainz/MusicBrainz API documentation", {"query": s("Documentation search")}, ("query",)),
+    spec("search_music_knowledge", "REQUIRED semantic retrieval: search indexed ListenBrainz and MusicBrainz API documentation and 35-entry genre/mood glossary; prefer for API explanations or terminology. Do NOT use for the user's listening history or previous conversations. Returns source sections and URLs.", {"query": s("Question about API docs or genre/mood vocabulary")}, ("query",)),
+    spec("search_knowledge", "Legacy alias of search_music_knowledge; do NOT use for user sessions or listening history", {"query": s("Documentation question")}, ("query",)),
     spec("recall_preferences", "Read actual previously expressed user preferences. Use BEFORE recommendations based on prior preferences; never infer genre solely from a recording title", {}),
     spec("remember_preference", "Remember only an EXPLICIT user preference quoted exactly from CURRENT request", {"key": s("Short key"), "value": s("Preference"), "evidence": s("Exact quote from this user request")}, ("key", "value", "evidence")),
+    spec("note_preference", "WRITE session preference only when user explicitly states it in the CURRENT message. Include verbatim evidence, not text from APIs. Do NOT infer preferences from music recommendations.", {"key": s("Preference key"), "value": s("Preference value"), "evidence": s("Exact phrase from current user request")}, ("key", "value", "evidence")),
     spec("forget_preference", "Forget one saved preference", {"key": s("Saved preference key")}, ("key",)),
     spec("final_answer", "Finish. Give truthful answer and status. Call only when done or unable to proceed", {"answer": s("Final explanation"), "status": {"type": "string", "enum": ["answered", "answered_low_confidence", "stuck"]}}, ("answer", "status")),
 ]
 INDEX = {x["function"]["name"]: x for x in SPECS}
-WRITE_ACTIONS = frozenset({"create_playlist", "add_playlist_tracks", "remove_playlist_tracks", "export_playlist"})
+WRITE_ACTIONS = frozenset({"create_playlist", "add_playlist_tracks", "remove_playlist_tracks", "add_playlist_items", "remove_playlist_items", "delete_playlist", "set_feedback", "export_playlist"})
 
 
 @dataclass
@@ -225,6 +244,62 @@ class Tools:
     def tool_get_top_artists(self, count=10, range="this_month"): return self.lb.top("artists", count, range)
     def tool_get_top_recordings(self, count=10, range="this_month"): return self.lb.top("recordings", count, range)
     def tool_get_playing_now(self): return self.lb.playing_now()
+
+    def tool_get_feedback(self, score=None, count=25, offset=0):
+        data = self.lb.get_feedback(score=score, count=count, offset=offset)
+        payload = data.get("payload", data)
+        rows = payload.get("feedback", payload.get("feedbacks", payload.get("items", []))) if isinstance(payload, dict) else []
+        if not isinstance(rows, list):
+            raise ServiceError("invalid", "Feedback response contains no feedback list")
+        return {"feedback": [{"recording_mbid": x.get("recording_mbid"),
+                               "score": x.get("score"),
+                               "created": x.get("created") or x.get("created_at"),
+                               "recording_name": (x.get("track_metadata") or {}).get("track_name")}
+                              for x in rows[:count] if isinstance(x, dict)],
+                "count": len(rows), "offset": offset}
+
+    def tool_lookup_artist(self, mbid):
+        data = self._catalog().lookup_artist(mbid)
+        relations = []
+        for relation in data.get("relations", [])[:80]:
+            if not isinstance(relation, dict):
+                continue
+            entity = relation.get("artist", {})
+            if relation.get("target-type") != "artist" or not isinstance(entity, dict):
+                continue
+            relations.append({"type": relation.get("type"),
+                              "direction": relation.get("direction"),
+                              "artist": entity.get("name"), "artist_mbid": entity.get("id"),
+                              "begin": relation.get("begin"), "end": relation.get("end")})
+        return {"mbid": data.get("id"), "name": data.get("name"),
+                "type": data.get("type"), "country": data.get("country"),
+                "relations": relations}
+
+    def tool_get_top_recordings_for_artist(self, artist_mbid):
+        data = self.lb.top_recordings_for_artist(artist_mbid)
+        rows = data.get("items", data.get("recordings", data.get("payload", [])))
+        if isinstance(rows, dict):
+            rows = rows.get("recordings", [])
+        if not isinstance(rows, list):
+            raise ServiceError("invalid", "Popularity endpoint response was not a recording list")
+        return {"artist_mbid": check_uuid(artist_mbid), "recordings": [
+            {"mbid": x.get("recording_mbid"), "title": x.get("recording_name"),
+             "artist": x.get("artist_name"), "listen_count": x.get("total_listen_count"),
+             "listener_count": x.get("total_user_count"), "duration_ms": x.get("length")}
+            for x in rows[:25] if isinstance(x, dict)]}
+
+    def tool_get_fresh_releases(self, days=30, sort="release_date"):
+        data = self.lb.fresh_releases(days=days, sort=sort)
+        payload = data.get("payload", data)
+        # Upstream may return a list or {releases: [...]} depending on deployment.
+        rows = payload if isinstance(payload, list) else payload.get("releases", payload.get("items", [])) if isinstance(payload, dict) else []
+        if not isinstance(rows, list):
+            raise ServiceError("invalid", "Fresh-releases response contained no release list")
+        return {"days": days, "releases": [
+            {"artist": x.get("artist_credit_name"), "title": x.get("release_name"),
+             "release_date": x.get("release_date"), "release_mbid": x.get("release_mbid"),
+             "release_group_mbid": x.get("release_group_mbid"), "type": x.get("release_group_primary_type")}
+            for x in rows[:40] if isinstance(x, dict)]}
 
 
     @staticmethod
@@ -588,6 +663,7 @@ class Tools:
         return result
 
     def tool_list_playlists(self): return self.lb.playlists()
+    def tool_find_playlists(self): return self.tool_list_playlists()
     def tool_get_playlist(self, playlist_mbid): return self.lb.playlist(playlist_mbid)
 
     def tool_filter_recent_candidates(self, days):
@@ -708,7 +784,7 @@ class Tools:
         return self._write("create_playlist", {"title": title, "mbids": cleaned,
                                                "exclude_days": exclude_days}, perform_create)
 
-    def _playlist_edit_snapshot(self, playlist_mbid: str) -> dict:
+    def _playlist_edit_snapshot(self, playlist_mbid: str, *, require_named_match: bool = True) -> dict:
         """Only the playlist detail endpoint includes actual tracks.
 
         User playlist listings return JSPF metadata with track:[] even when
@@ -732,16 +808,17 @@ class Tools:
         user = getattr(self.lb, "username", None)
         if creator and user and str(creator).casefold() != str(user).casefold():
             raise ServiceError("policy_halt", "Cannot edit a playlist owned by another user")
-        match = re.search(
-            r"\b(?:to|from|in)\s+(?:my\s+)?(.+?)\s+playlist\b",
-            self.goal, re.I,
-        )
-        if not match:
-            raise ServiceError("resource", "Please name the existing playlist to edit")
-        requested = re.sub(r"^\[Encore\]\s*", "", match.group(1).strip(), flags=re.I)
-        actual = re.sub(r"^\[Encore\]\s*", "", str(entry.get("title", "")).strip(), flags=re.I)
-        if requested.casefold() != actual.casefold():
-            raise ServiceError("invalid", f"Requested playlist {requested!r}, but selected {actual!r}")
+        if require_named_match:
+            match = re.search(
+                r"\b(?:to|from|in)\s+(?:my\s+)?(.+?)\s+playlist\b",
+                self.goal, re.I,
+            )
+            if not match:
+                raise ServiceError("resource", "Please name the existing playlist to edit")
+            requested = re.sub(r"^\[Encore\]\s*", "", match.group(1).strip(), flags=re.I)
+            actual = re.sub(r"^\[Encore\]\s*", "", str(entry.get("title", "")).strip(), flags=re.I)
+            if requested.casefold() != actual.casefold():
+                raise ServiceError("invalid", f"Requested playlist {requested!r}, but selected {actual!r}")
         return {"mbid": playlist_mbid, "title": entry["title"],
                 "tracks": tracks, "mbids": [item[0] for item in ids]}
 
@@ -872,13 +949,94 @@ class Tools:
                            {"playlist_mbid": snapshot["mbid"], "index": index, "count": count},
                            perform_remove, summary=description)
 
+    def tool_add_playlist_items(self, playlist_mbid, mbids):
+        return self.tool_add_playlist_tracks(playlist_mbid, mbids)
+
+    def tool_remove_playlist_items(self, playlist_mbid, index, count):
+        return self.tool_remove_playlist_tracks(playlist_mbid, index, count)
+
+    def tool_delete_playlist(self, playlist_mbid):
+        """Delete an explicitly named Encore-owned playlist, with human approval."""
+        goal = self.goal.casefold()
+        if not re.search(r"\b(delete|remove)\b", goal) or not re.search(r"\bplaylists?\b", goal):
+            raise ServiceError("policy_halt", "User did not request whole-playlist deletion")
+        if re.search(r"\b(?:including|even|also)\b.{0,50}\b(?:not\s+(?:made|created|owned)\s+by\s+encore|non[- ]?encore|other\s+people|everyone)\b", goal):
+            raise ServiceError("policy_halt", "Deletion beyond Encore-created playlists is forbidden")
+        playlist_mbid = check_uuid(playlist_mbid)
+        raw = self.lb.playlist(playlist_mbid)
+        entry = raw.get("payload", raw).get("playlist") if isinstance(raw, dict) else None
+        if not isinstance(entry, dict):
+            raise ServiceError("resource", "Could not inspect actual playlist; no deletion attempted")
+        title = str(entry.get("title", "")).strip()
+        if not title.startswith("[Encore] "):
+            raise ServiceError("policy_halt", "Only Encore-created playlists may be deleted")
+        # A named user request must identify the actual playlist. For an 'all'
+        # request, all candidate playlists must still individually pass owner
+        # and marker checks, each with its own approval.
+        if not re.search(r"\b(all|every|each)\s+(?:my\s+)?playlists?\b", goal):
+            cleaned_title = title.removeprefix("[Encore] ").casefold().strip()
+            if cleaned_title and cleaned_title not in goal and title.casefold() not in goal:
+                raise ServiceError("invalid", "Requested playlist name does not match the target")
+        owner = str(entry.get("creator", "")).strip()
+        user = str(getattr(self.lb, "username", "")).strip()
+        if not owner or not user or owner.casefold() != user.casefold():
+            raise ServiceError("policy_halt", "Playlist ownership could not be confirmed")
+        tracks = entry.get("track")
+        if not isinstance(tracks, list):
+            raise ServiceError("resource", "Playlist detail omitted track count; deletion blocked")
+        description = (f"DELETE ENTIRE PLAYLIST: {title}\n"
+                       f"Owner: {owner}\nTracks removed from playlist: {len(tracks)}\n"
+                       "This permanently deletes the real ListenBrainz playlist (not the recordings themselves).")
+        def perform_delete():
+            self.lb.delete_playlist(playlist_mbid)
+            result = {"playlist_mbid": playlist_mbid, "title": title,
+                      "deleted": True, "confirmed": False}
+            try:
+                self.lb.playlist(playlist_mbid)
+                result["warning"] = "Delete accepted, but playlist still readable; reconcile before retrying"
+            except ServiceError as exc:
+                if exc.kind == "not_found":
+                    result["confirmed"] = True
+                else:
+                    result["warning"] = "Delete accepted but readback unavailable; check account before retrying"
+            return result
+        return self._write("delete_playlist", {"playlist_mbid": playlist_mbid},
+                           perform_delete, summary=description)
+
+    def tool_set_feedback(self, recording_mbid, score):
+        goal = self.goal.casefold()
+        if not re.search(r"\b(love|loved|like|liked|hate|hated|dislike|clear|remove|unlove|unhate|feedback|rating)\b", goal):
+            raise ServiceError("policy_halt", "No explicit feedback instruction in current message")
+        mbid = check_uuid(recording_mbid)
+        # Prevent the model choosing a random MBID not tied to the current request.
+        if mbid not in self.verified and mbid not in self.searched_recordings:
+            raise ServiceError("invalid", "Search/verify the recording MBID in this session first")
+        known = self.verified.get(mbid) or self.searched_recordings.get(mbid) or {}
+        title = known.get("title", "Unknown title")
+        labels = {1: "LOVE", -1: "HATE", 0: "CLEAR"}
+        # Detect contradictions between the requested feedback and proposed score.
+        if re.search(r"\b(?:hate|hated|dislike)\b", goal) and score != -1:
+            raise ServiceError("invalid", "Requested hate feedback requires score=-1")
+        if re.search(r"\b(?:love|loved|like|liked)\b", goal) and score != 1:
+            raise ServiceError("invalid", "Requested love feedback requires score=1")
+        if re.search(r"\b(?:clear|remove|unlove|unhate)\b", goal) and score != 0:
+            raise ServiceError("invalid", "Requested removal of feedback requires score=0")
+        summary = (f"{labels[score]} recording feedback for {title}\n"
+                   f"Recording MBID: {mbid}\nThis modifies your real ListenBrainz feedback.")
+        return self._write("set_feedback", {"recording_mbid": mbid, "score": score},
+                           lambda: self.lb.set_feedback(mbid, score), summary=summary)
+
     def tool_export_playlist(self, playlist_mbid, service):
         return self._write("export_playlist", {"playlist_mbid": playlist_mbid, "service": service},
                            lambda: self.lb.export(playlist_mbid, service))
 
     def tool_search_past_sessions(self, query): return self.mem.search_sessions(query)
+    def tool_search_music_knowledge(self, query): return self.mem.search_knowledge(query)
     def tool_search_knowledge(self, query): return self.mem.search_knowledge(query)
     def tool_recall_preferences(self): return self.mem.preferences()
+
+    def tool_note_preference(self, key, value, evidence):
+        return self.tool_remember_preference(key, value, evidence)
 
     def tool_remember_preference(self, key, value, evidence):
         if not evidence or evidence.casefold() not in self.goal.casefold():
