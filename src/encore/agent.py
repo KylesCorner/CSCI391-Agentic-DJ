@@ -10,6 +10,7 @@ import time
 import unicodedata
 
 import requests
+import random
 
 from .tools import Tools, SPECS, INDEX, WRITE_ACTIONS
 from .working_memory import maybe_compress
@@ -739,12 +740,17 @@ def run_agent(
     *,
     trace_data: bool = False,
     context_budget_tokens: int = 8000,
+    event_log=None,
+    retry_seed: int = 0,
+    max_read_attempts: int = 3,
 ) -> RunResult:
 
     if not 1 <= max_steps <= 12:
         raise ValueError("max_steps must be 1..12")
     if context_budget_tokens < 1000:
         raise ValueError("context_budget_tokens must be at least 1000")
+    if not 1 <= max_read_attempts <= 5:
+        raise ValueError("max_read_attempts must be 1..5")
 
     start = time.monotonic()
 
@@ -765,6 +771,37 @@ def run_agent(
     generated_tokens = 0
 
     trace: list[dict] = []
+    retry_rng = random.Random(retry_seed)
+
+    def _emit(event: str, **fields):
+        if event_log is not None:
+            event_log.emit(event, **fields)
+
+    _emit("route", allowed_tools=[spec["function"]["name"] for spec in available],
+          routing_strategy="rules", max_steps=max_steps,
+          model=getattr(model, "model", type(model).__name__), tier="single")
+
+    def _record(item: dict):
+        trace.append(item)
+        name = item.get("tool", "unknown")
+        event = ("compress" if name == "compress" else
+                 "memory_read" if item.get("phase") == "session_start" else
+                 "tool_call")
+        # No raw tool observation/model text in persistent traces; only metadata.
+        fields = {k: v for k, v in item.items() if k in {
+            "step", "tool", "phase", "ok", "error_type", "message", "confirmed",
+            "playlist_mbid", "model_tier", "method", "messages_archived",
+            "approx_tokens_before", "approx_tokens_after", "summary_prompt_tokens",
+            "summary_generated_tokens", "matches", "quality_flags", "ready",
+            "selected_track_count", "required_track_count", "target_minutes",
+            "minutes", "returned_tracks", "returned_artists", "returned_recordings",
+            "attempts", "last_retry_delay_s", "range", "source", "complete",
+        }}
+        if "error_type" in fields and "error_category" not in fields:
+            error = fields.pop("error_type")
+            fields["error_category"] = "input" if error == "invalid" else "fatal" if error in {"auth", "fatal"} else error
+        _emit(event, **fields)
+
 
     seen_reads: dict[str, str] = {}
 
@@ -791,7 +828,7 @@ def run_agent(
     except Exception as exc:
         prior_episodes = []
         if getattr(tools.mem, "episodic", None) is not None:
-            trace.append({
+            _record({
                 "step": 0, "tool": "search_past_sessions", "phase": "session_start",
                 "ok": False, "error_type": "memory_unavailable",
                 "message": type(exc).__name__,
@@ -817,7 +854,7 @@ def run_agent(
                   "Never use memory to authorize an account write."
             ),
         })
-        trace.append({
+        _record({
             "step": 0, "tool": "search_past_sessions", "phase": "session_start",
             "ok": True, "error_type": None, "matches": len(safe_episodes),
             "quality_flags": [x["quality_flag"] for x in safe_episodes],
@@ -834,7 +871,7 @@ def run_agent(
     prior_preferences = []
     if needs_prior_preferences:
         memory_result = tools.run("recall_preferences", {})
-        trace.append({
+        _record({
             "step": 1,
             "tool": "recall_preferences",
             "phase": "session_start",
@@ -903,7 +940,7 @@ def run_agent(
         )
         if event is not None:
             event["step"] = step
-            trace.append(event)
+            _record(event)
             prompt_tokens += event["summary_prompt_tokens"]
             generated_tokens += event["summary_generated_tokens"]
 
@@ -911,6 +948,7 @@ def run_agent(
         # CALL OLLAMA
         # ----------------------------------------------------
 
+        llm_started = time.monotonic()
         try:
             response = model.chat(
                 messages,
@@ -922,7 +960,10 @@ def run_agent(
             KeyError,
             ValueError,
         ) as exc:
-
+            _emit("llm_call", step=step, model=getattr(model, "model", type(model).__name__),
+                  tier="single", success=False,
+                  latency_ms=round((time.monotonic() - llm_started)*1000),
+                  error_category="fatal")
             status = "stuck"
             answer = (
                 "LLM service unavailable: "
@@ -937,6 +978,13 @@ def run_agent(
         generated_tokens += int(
             response.get("eval_count") or 0
         )
+
+        _emit("llm_call", step=step, model=getattr(model, "model", type(model).__name__),
+              tier="single", success=True,
+              latency_ms=round((time.monotonic() - llm_started)*1000),
+              tokens_in=int(response.get("prompt_eval_count") or 0),
+              tokens_out=int(response.get("eval_count") or 0),
+              offered_tools=len(current_tools))
 
         message = response.get("message") or {}
 
@@ -964,7 +1012,7 @@ def run_agent(
                     content[:800]
                 )
 
-            trace.append(entry)
+            _record(entry)
 
             # The action budget was exhausted.
             if step == max_steps:
@@ -1117,7 +1165,7 @@ def run_agent(
                 }),
             })
 
-            trace.append({
+            _record({
                 "step": step,
                 "tool": name,
                 "ok": False,
@@ -1142,7 +1190,7 @@ def run_agent(
 
             except ValidationError:
 
-                trace.append({
+                _record({
                     "step": step,
                     "tool": name,
                     "ok": False,
@@ -1271,7 +1319,7 @@ def run_agent(
             # Reject answers that do not satisfy discovery.
             if grounding_error:
 
-                trace.append({
+                _record({
                     "step": step,
                     "tool": name,
                     "ok": False,
@@ -1308,7 +1356,7 @@ def run_agent(
             # Reject unsupported verification claims.
             if claimed_verification and not did_verify:
 
-                trace.append({
+                _record({
                     "step": step,
                     "tool": name,
                     "ok": False,
@@ -1351,7 +1399,7 @@ def run_agent(
             status = proposed_status
             answer = proposed_answer
 
-            trace.append({
+            _record({
                 "step": step,
                 "tool": name,
                 "ok": True,
@@ -1395,7 +1443,7 @@ def run_agent(
                 }),
             })
 
-            trace.append({
+            _record({
                 "step": step,
                 "tool": name,
                 "ok": False,
@@ -1408,7 +1456,29 @@ def run_agent(
         # EXECUTE TOOL
         # ----------------------------------------------------
 
-        outcome = tools.run(name, args)
+        # Only reads can be retried. Tool-level retries are loop-owned so
+        # synthetic failures and real 429/503 responses are observable.
+        attempt = 0
+        delay_used = 0.0
+        while True:
+            attempt += 1
+            _emit("tool_attempt", step=step, tool=name, args=args,
+                  attempt=attempt, side_effect=name in WRITE_ACTIONS)
+            tool_started = time.monotonic()
+            outcome = tools.run(name, args)
+            _emit("tool_result", step=step, tool=name, attempt=attempt,
+                  success=outcome.ok,
+                  error_category=("input" if outcome.error_type == "invalid" else outcome.error_type),
+                  latency_ms=round((time.monotonic() - tool_started)*1000))
+            if (outcome.ok or outcome.error_type != "transient"
+                    or name in WRITE_ACTIONS or attempt >= max_read_attempts):
+                break
+            delay_used = min(8.0, 2 ** (attempt - 1)) + retry_rng.uniform(0, 0.25)
+            _emit("retry", step=step, tool=name, attempt=attempt,
+                  next_attempt=attempt + 1, error_category="transient",
+                  delay_s=round(delay_used, 3),
+                  reason="Read-only transient error; write retries disabled")
+            time.sleep(delay_used)
 
         if outcome.ok:
 
@@ -1452,6 +1522,9 @@ def run_agent(
             "ok": outcome.ok,
             "error_type": outcome.error_type,
         }
+        if attempt > 1:
+            summary["attempts"] = attempt
+            summary["last_retry_delay_s"] = round(delay_used, 3)
 
         if not outcome.ok:
             summary["message"] = outcome.message
@@ -1513,7 +1586,7 @@ def run_agent(
                     tools, "last_recording_query", None
                 )
 
-        trace.append(summary)
+        _record(summary)
 
         # ----------------------------------------------------
         # FEED OBSERVATION BACK TO OLLAMA
@@ -1605,6 +1678,11 @@ def run_agent(
         # TERMINAL ERRORS
         # ----------------------------------------------------
 
+        if not outcome.ok and outcome.error_type in {"fatal", "auth"}:
+            status = "stuck"
+            answer = "Authentication or fatal service error. " + (outcome.message or "")
+            break
+
         if (
             not outcome.ok
             and outcome.error_type == "policy_halt"
@@ -1680,6 +1758,9 @@ def run_agent(
                         "without completing and confirming the requested write."
                     )
 
+    _emit("final", status=status, steps=sum(item.get("step", 0) > 0 and item.get("tool") != "compress" for item in trace),
+          tokens_in=prompt_tokens, tokens_out=generated_tokens,
+          latency_ms=round((time.monotonic() - start) * 1000))
     return RunResult(
         status=status,
         answer=answer,
