@@ -191,7 +191,8 @@ def main():
         safe_goal = _strip_secrets(goal, (cfg.token,))
         safe_answer = _strip_secrets(result.answer, (cfg.token,))
         summarizer = SessionSummarizer(
-            cfg.ollama_host, cfg.summary_model, secrets=(cfg.token,)
+            cfg.ollama_host, cfg.summary_model, secrets=(cfg.token,),
+            reporter=session_trace.emit,
         )
         session_trace.emit("memory_summary_start", model=cfg.summary_model, tier="cheap")
         try:

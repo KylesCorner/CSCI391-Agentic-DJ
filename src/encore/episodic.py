@@ -13,6 +13,7 @@ import re
 from uuid import uuid4
 
 import requests
+import time
 from jsonschema import validate, ValidationError
 
 
@@ -80,15 +81,17 @@ class OllamaEmbedder:
 class SessionSummarizer:
     """Two independent structured LLM calls: summary, then quality review."""
 
-    def __init__(self, host: str, model: str, *, secrets: tuple[str, ...] = ()):
+    def __init__(self, host: str, model: str, *, secrets: tuple[str, ...] = (), reporter=None):
         self.host = host.rstrip("/")
         self.model = model
         self.secrets = secrets
+        self.reporter = reporter
 
-    def _ask(self, system: str, payload: dict, schema: dict) -> dict:
+    def _ask(self, system: str, payload: dict, schema: dict, *, phase: str = "episodic") -> dict:
         safe_payload = _strip_secrets(json.dumps(payload, ensure_ascii=False), self.secrets)
         last_error = None
         for attempt in range(2):
+            call_started = time.monotonic()
             response = requests.post(
                 f"{self.host}/api/chat",
                 json={
@@ -105,13 +108,26 @@ class SessionSummarizer:
                 timeout=(5, 180),
             )
             response.raise_for_status()
-            content = response.json().get("message", {}).get("content") or ""
+            payload_json = response.json()
+            content = payload_json.get("message", {}).get("content") or ""
             try:
                 value = json.loads(content)
                 validate(value, schema)
-                return value
+                valid = True
             except (json.JSONDecodeError, ValidationError) as exc:
                 last_error = exc
+                valid = False
+            if self.reporter is not None:
+                self.reporter(
+                    "llm_call", phase=getattr(self, "_phase", phase), attempt=attempt + 1,
+                    model=self.model, tier="cheap", success=valid,
+                    tokens_in=int(payload_json.get("prompt_eval_count") or 0),
+                    tokens_out=int(payload_json.get("eval_count") or 0),
+                    latency_ms=round((time.monotonic()-call_started)*1000),
+                    error_category=None if valid else type(last_error).__name__,
+                )
+            if valid:
+                return value
         raise ValueError(
             f"Ollama did not return valid structured JSON after two attempts: "
             f"{type(last_error).__name__}"
@@ -128,10 +144,12 @@ class SessionSummarizer:
             for event in tool_trace
         ]
         evidence = {"goal": goal, "answer": answer, "status": status, "events": safe_events}
+        self._phase = "episodic_summary"
         summary = self._ask(
             _prompt("episodic_summary_v1.md", "Summarize one session factually. Never fabricate."),
             evidence, SUMMARY_SCHEMA,
         )
+        self._phase = "episodic_quality"
         review = self._ask(
             _prompt("episodic_quality_v1.md", "Review a session memory against supplied evidence."),
             {"evidence": evidence, "proposed_summary": summary}, QUALITY_SCHEMA,
