@@ -362,7 +362,7 @@ def requested_discovery_count(goal: str) -> int | None:
     match = re.search(
         r"\b(\d{1,2})\s+"
         r"(?:[\w-]+\s+){0,5}"
-        r"(?:songs?|tracks?|recordings?)\b",
+        r"(?:songs?|tunes?|tracks?|recordings?)\b",
         low,
     )
 
@@ -406,6 +406,7 @@ def _remember_candidates(
     elif name in {
         "search_recordings",
         "get_recommendations",
+        "get_top_recordings_for_artist",
     }:
         if isinstance(data, list):
             rows = data
@@ -472,6 +473,74 @@ def _remember_candidates(
                 ],
             },
         )
+
+
+def grounded_popularity_answer(goal: str, data: dict) -> tuple[str, list[str]] | None:
+    """Complete a simple N-popular-ARTIST-tunes lookup from observed LB data.
+
+    This is deliberately a narrow, read-only path. More complex recommendations
+    continue through ReAct/final_answer and its grounding checks. No model text,
+    episodic summary, or guessed recording identifier is accepted as evidence.
+    """
+    from uuid import UUID
+
+    request = re.fullmatch(
+        r"\s*(?:(?:can|could|would)\s+you\s+|please\s+)?"
+        r"(?:find|show|give|recommend)\s+(?:me\s+)?"
+        r"(?P<count>[1-9]\d?)\s+(?P<artist>.+?)\s+"
+        r"(?:songs?|tunes?|tracks?|recordings?)\s+"
+        r"(?:(?:that|which)\s+are\s+)?(?:most\s+)?popular\s*[?!.,]*\s*",
+        goal, flags=re.IGNORECASE,
+    )
+    if not request or not isinstance(data, dict):
+        return None
+    artist = request.group("artist").strip()
+    count = int(request.group("count"))
+    if not 1 <= count <= 10 or not 2 <= len(artist) <= 80:
+        return None
+    if re.search(r"\b(?:similar|like|from|between|after|before|instrumental|without|excluding)\b", artist, re.I):
+        return None
+    rows = data.get("recordings")
+    if not isinstance(rows, list):
+        return None
+
+    valid = []
+    seen = set()
+    for item in rows:
+        if not isinstance(item, dict):
+            continue
+        title = item.get("title")
+        credit = item.get("artist")
+        plays = item.get("listen_count")
+        mbid = item.get("mbid")
+        if not (isinstance(title, str) and title.strip()
+                and isinstance(credit, str) and credit.strip()
+                and _normalize(artist) == _normalize(credit)
+                and isinstance(plays, int) and not isinstance(plays, bool)
+                and plays >= 0 and isinstance(mbid, str)):
+            continue
+        try:
+            mbid = str(UUID(mbid))
+        except (ValueError, TypeError, AttributeError):
+            continue
+        key = (_normalize(credit), _normalize(title))
+        if key in seen:
+            continue
+        seen.add(key)
+        valid.append((title.strip(), credit.strip(), plays, mbid))
+
+    if len(valid) < count:
+        return None
+    valid.sort(key=lambda item: item[2], reverse=True)
+    top = valid[:count]
+    lines = [
+        f"{idx}. {title} — {credit} ({plays:,} ListenBrainz listens)"
+        for idx, (title, credit, plays, _) in enumerate(top, 1)
+    ]
+    answer = (f"Here are {count} popular {artist} recordings based on "
+              "the ListenBrainz listen counts returned by the API:\n"
+              + "\n".join(lines))
+    return answer, [mbid for _, _, _, mbid in top]
 
 
 # ============================================================

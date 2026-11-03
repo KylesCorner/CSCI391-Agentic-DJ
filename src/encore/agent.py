@@ -19,7 +19,7 @@ from .ollama_client import Ollama
 from .agent_policies import (
     route, compact_observation, requested_discovery_count,
     _normalize, _remember_candidates, _answer_grounding_error,
-    positive_verification_claim,
+    positive_verification_claim, grounded_popularity_answer,
 )
 from .router import DOMAIN_SCHEMA, DOMAINS, validate_domains, tools_for_domains, TOOL_DOMAIN
 from jsonschema import validate as schema_validate, ValidationError as SchemaValidationError
@@ -686,13 +686,18 @@ def run_agent(
                     INDEX[name]["function"]["parameters"],
                 )
 
-            except ValidationError:
+            except ValidationError as exc:
 
+                # Give the model a concrete, bounded schema error instead of
+                # a generic failure that it may repeat for every remaining step.
+                schema_issue = f"{'.'.join(str(p) for p in exc.path) or 'root'}: {exc.message}"
+                schema_issue = schema_issue[:350]
                 _record({
                     "step": step,
                     "tool": name,
                     "ok": False,
                     "error_type": "invalid",
+                    "message": schema_issue,
                 })
 
                 messages.append({
@@ -708,7 +713,13 @@ def run_agent(
                         "ok": False,
                         "error_type": "invalid",
                         "message": (
-                            "Final answer failed schema validation."
+                            "Final answer failed schema validation: "
+                            + schema_issue
+                            + ". Return exactly answer (string), status "
+                              "(answered, answered_low_confidence, or stuck), "
+                              "confidence (high, medium, or low), and sources "
+                              "(list of observed identifiers). Answer the "
+                              "CURRENT original user goal, not an old session."
                         ),
                     }),
                 })
@@ -1213,6 +1224,21 @@ def run_agent(
                 )
 
         _record(summary)
+
+        # Avoid an unnecessary LLM finalization pass for a simple, fully
+        # grounded ranked-artist lookup. In particular, this prevents stale
+        # episodic context and malformed final_answer arguments from turning
+        # a successful 2-song read into a bogus 20-track playlist diagnosis.
+        if outcome.ok and name == "get_top_recordings_for_artist":
+            popularity = grounded_popularity_answer(goal, outcome.data)
+            if popularity is not None:
+                answer, final_sources = popularity
+                status = "answered"
+                final_confidence = "high"
+                _emit("grounded_read_completion", step=step,
+                      source="get_top_recordings_for_artist",
+                      recording_count=len(final_sources))
+                break
 
         # ----------------------------------------------------
         # FEED OBSERVATION BACK TO OLLAMA
