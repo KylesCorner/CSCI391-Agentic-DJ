@@ -143,7 +143,9 @@ def route(goal: str) -> list[dict]:
 
     # Route mutations by the action the user actually requested. The model
     # may choose tools within a domain but cannot choose a different write.
-    if "playlist" in low and re.search(r"\b(add|append|insert)\b", low):
+    if "playlist" in low and re.search(
+        r"\b(?:add|adding|append|appending|insert|inserting)\b", low,
+    ):
         names = {"list_playlists", "get_playlist", "search_recordings",
                  "search_artists", "verify_recordings", "lb_radio",
                  "add_playlist_tracks", "add_playlist_items", "find_playlists", "final_answer"}

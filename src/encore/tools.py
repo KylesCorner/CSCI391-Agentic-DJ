@@ -236,6 +236,20 @@ class Tools(PlaylistToolsMixin):
         """
         if not re.search(r"\bplaylist\b", self.goal, re.I):
             return None
+
+        # A count describes the number of songs, not the artist or a title.
+        # E.g. "Add 5 distinct recordings by Edmond Hall to my playlist."
+        by_artist = re.search(
+            r"\b(?:recordings?|songs?|tracks?)\s+by\s+"
+            r"(?P<artist>.+?)"
+            r"(?=\s+(?:to|into|in)\s+(?:my\s+|the\s+)?|[.!?]|$)",
+            self.goal, re.I,
+        )
+        if by_artist:
+            artist = by_artist.group("artist").strip()
+            if artist and not self._is_generic_music_descriptor(artist):
+                return artist
+
         match = re.search(
             r"\b(?:with|of)\s+\d{1,2}\s+(?:distinct\s+)?"
             r"(?P<artist>[\w&'’.-]+(?:\s+[\w&'’.-]+){0,4}?)\s+"
@@ -245,7 +259,7 @@ class Tools(PlaylistToolsMixin):
         )
         if not match:
             match = re.search(
-                r"\badd\s+\d{1,2}\s+(?:distinct\s+)?"
+                r"\b(?:add|adding|append|appending|insert|inserting)\s+\d{1,2}\s+(?:distinct\s+)?"
                 r"(?P<artist>[\w&'’.-]+(?:\s+[\w&'’.-]+){0,4}?)\s+"
                 r"(?:recordings?|songs?|tracks?)\b",
                 self.goal, re.I,
@@ -363,7 +377,24 @@ class Tools(PlaylistToolsMixin):
                 r"\badd\s+(.+?)\s+by\s+.+?\s+to\s+(?:my\s+)?",
                 self.goal, re.I,
             )
-            if specific_song:
+            # "Add 5 distinct recordings by Artist" is NOT a song title.
+            # Only force a recording: predicate for an actual named song.
+            count_request = (
+                specific_song is not None
+                and re.fullmatch(
+                    r"\d{1,2}\s+(?:distinct\s+)?(?:recordings?|songs?|tracks?)",
+                    specific_song.group(1).strip(), re.I,
+                ) is not None
+            )
+            if count_request or (
+                specific_song is None
+                and self._requested_playlist_track_count() is not None
+                and re.search(r"\b(?:add|adding|append|appending|insert|inserting)\b", self.goal, re.I)
+            ):
+                # The model may itself have guessed recording:"5 distinct recordings".
+                # Discard that spurious title predicate for multi-track requests.
+                query = f'artist:"{safe}"'
+            elif specific_song:
                 requested_title = specific_song.group(1).strip()
                 escaped_title = requested_title.replace("\\", "\\\\").replace('"', '\\"')
                 query = f'recording:"{escaped_title}" AND artist:"{safe}"'
@@ -579,7 +610,73 @@ class Tools(PlaylistToolsMixin):
         return result
 
     def tool_list_playlists(self): return self.lb.playlists()
-    def tool_find_playlists(self): return self.tool_list_playlists()
+    def tool_find_playlists(self, title=None):
+        """Find own playlists by full title or by title without '[Encore]'.
+
+        ListenBrainz returns a name such as '[Encore] Swingin Clarinet'.
+        The model may pass 'Swingin Clarinet'; resolve that to the actual
+        playlist entry instead of reporting a misleading successful zero-match
+        result. Never choose an ambiguous alias without disambiguation.
+        Playlist *listings* are metadata only; edit tools read full detail.
+        """
+        if title is None:
+            return self.tool_list_playlists()
+
+        target = str(title).strip()
+        if not target:
+            raise ServiceError("invalid", "Playlist title must not be empty")
+
+        def title_key(value: str) -> str:
+            bare = re.sub(r"^\[Encore\]\s*", "", str(value).strip(), flags=re.I)
+            return " ".join(bare.casefold().split())
+
+        normalized = title_key(target)
+        matches = []
+        for offset in range(0, 500, 100):
+            response = self.lb.playlists(count=100, offset=offset)
+            payload = response.get("payload", response) if isinstance(response, dict) else None
+            rows = payload.get("playlists") if isinstance(payload, dict) else None
+            if not isinstance(rows, list):
+                raise ServiceError("resource", "Playlist listing has an unexpected format")
+
+            for row in rows:
+                item = row.get("playlist", row) if isinstance(row, dict) else None
+                if isinstance(item, dict) and title_key(item.get("title", "")) == normalized:
+                    matches.append(row)
+
+            if len(rows) < 100:
+                break
+        else:
+            raise ServiceError("resource", "Playlist search exceeded the safe listing limit")
+
+        if len(matches) > 1:
+            # If the user explicitly named [Encore] NAME, select that full
+            # title only. Otherwise do not silently select between an
+            # unprefixed and a prefixed playlist with the same base title.
+            prefixed = [row for row in matches if str(
+                row.get("playlist", row).get("title", "")
+            ).strip().casefold() == f"[encore] {normalized}"]
+            if f"[encore] {normalized}" in self.goal.casefold() and len(prefixed) == 1:
+                matches = prefixed
+            else:
+                titles = [str(row.get("playlist", row).get("title")) for row in matches]
+                raise ServiceError(
+                    "resource",
+                    "Ambiguous playlist title; name the exact playlist: "
+                    + ", ".join(titles[:10]),
+                )
+
+        return {
+            "count": len(matches),
+            "offset": 0,
+            "playlist_count": len(matches),
+            "playlists": matches,
+            "matched_title": (
+                matches[0].get("playlist", matches[0]).get("title")
+                if matches else None
+            ),
+            "query_title": target,
+        }
     def tool_get_playlist(self, playlist_mbid): return self.lb.playlist(playlist_mbid)
 
     def tool_filter_recent_candidates(self, days):

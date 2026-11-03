@@ -122,8 +122,8 @@ def main():
         if args.command == "ask":
             if not 1 <= args.read_attempts <= 5:
                 parser.error("--read-attempts must be between 1 and 5")
-            if not 1 <= args.steps <= 12:
-                parser.error("--steps must be between 1 and 12")
+            if not 1 <= args.steps <= 25:
+                parser.error("--steps must be between 1 and 25")
             try:
                 injection = FaultInjector.load(args.inject) if args.inject else None
             except (OSError, ValueError, json.JSONDecodeError) as exc:

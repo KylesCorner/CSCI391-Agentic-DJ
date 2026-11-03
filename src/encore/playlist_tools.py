@@ -150,24 +150,49 @@ class PlaylistToolsMixin:
         if creator and user and str(creator).casefold() != str(user).casefold():
             raise ServiceError("policy_halt", "Cannot edit a playlist owned by another user")
         if require_named_match:
+            # A playlist edit must identify the exact existing title, even
+            # when its ID was obtained by the model. Keep owner check above.
             match = re.search(
-                r"\b(?:to|from|in)\s+(?:my\s+)?(.+?)\s+playlist\b",
+                r"\b(?:to|from|in|edit)\s+(?:my\s+|the\s+)?"
+                r"(?P<name>.+?)\s+playlist\b",
                 self.goal, re.I,
             )
+            # "edit that playlist" refers to the playlist named earlier in
+            # the user's request; "that" is not the actual title.
+            if match and match.group("name").strip().casefold() in {
+                "that", "this", "the", "existing", "same", "that same",
+            }:
+                match = None
+            if not match:
+                match = re.search(
+                    r"\bplaylist\s+(?:named|called|titled)\s+"
+                    r"(?P<name>.+?)"
+                    r"(?=\s+(?:is|was|has|already)\b|[.!?]|$)",
+                    self.goal, re.I,
+                )
             if not match:
                 raise ServiceError("resource", "Please name the existing playlist to edit")
-            requested = re.sub(r"^\[Encore\]\s*", "", match.group(1).strip(), flags=re.I)
-            actual = re.sub(r"^\[Encore\]\s*", "", str(entry.get("title", "")).strip(), flags=re.I)
-            if requested.casefold() != actual.casefold():
-                raise ServiceError("invalid", f"Requested playlist {requested!r}, but selected {actual!r}")
+
+            def normalized_name(value: str) -> str:
+                return re.sub(
+                    r"^\[Encore\]\s*", "", value.strip().strip("\"'"),
+                    flags=re.I,
+                ).strip().casefold()
+
+            requested = normalized_name(match.group("name"))
+            actual = normalized_name(str(entry.get("title", "")))
+            if not requested or requested != actual:
+                raise ServiceError(
+                    "invalid", f"Requested playlist {requested!r}, but selected {actual!r}"
+                )
         return {"mbid": playlist_mbid, "title": entry["title"],
                 "tracks": tracks, "mbids": [item[0] for item in ids]}
 
     def _require_edit_request(self, action: str):
         low = self.goal.casefold()
         patterns = {
-            "add_playlist_tracks": r"\b(add|append|insert)\b",
-            "remove_playlist_tracks": r"\b(remove|delete)\b",
+            "add_playlist_tracks": r"\b(?:add|adding|append|appending|insert|inserting)\b",
+            "remove_playlist_tracks": r"\b(?:remove|removing|delete|deleting)\b",
         }
         if not ("playlist" in low and re.search(patterns[action], low)):
             raise ServiceError("policy_halt", f"User did not request {action}; no write performed")
@@ -181,7 +206,10 @@ class PlaylistToolsMixin:
         if set(cleaned) & set(snapshot["mbids"]):
             raise ServiceError("resource", "One or more tracks are already in this playlist; nothing added")
 
-        expected = re.search(r"\badd\s+(\d{1,2})\s+", self.goal, re.I)
+        expected = re.search(
+            r"\b(?:add|adding|append|appending|insert|inserting)\s+(\d{1,2})\s+",
+            self.goal, re.I,
+        )
         if expected and len(cleaned) != int(expected.group(1)):
             raise ServiceError("invalid", f"User requested {expected.group(1)} tracks; got {len(cleaned)}")
 
@@ -208,7 +236,15 @@ class PlaylistToolsMixin:
             r"\badd\s+(.+?)\s+by\s+.+?\s+to\s+(?:my\s+)?",
             self.goal, re.I,
         )
-        if requested_song:
+        # A multi-track quantity is not an individual requested song title.
+        count_request = (
+            requested_song is not None
+            and re.fullmatch(
+                r"\d{1,2}\s+(?:distinct\s+)?(?:recordings?|songs?|tracks?)",
+                requested_song.group(1).strip(), re.I,
+            ) is not None
+        )
+        if requested_song and not count_request:
             target_title = self._key("", requested_song.group(1))[1]
             if len(cleaned) != 1 or self._key("", titles[0])[1] != target_title:
                 raise ServiceError("invalid", "Selected recording title does not match the requested song")

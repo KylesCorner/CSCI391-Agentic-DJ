@@ -269,6 +269,18 @@ def run_agent(
     final_confidence = "low"
     final_sources: list[str] = []
 
+    # An incomplete edit should not terminate on the model's first
+    # premature final_answer. Recovery is bounded by this counter.
+    premature_edit_finals = 0
+    edit_requested = (
+        "playlist" in goal.casefold()
+        and bool(re.search(
+            r"\b(?:add|adding|append|appending|insert|inserting)\b",
+            goal, re.I,
+        ))
+    )
+    edit_tool_names = {"add_playlist_tracks", "add_playlist_items"}
+
     # Episodic recall is a session-initialization read, not a model action.
     # Inject only the top 3 user-scoped summaries and explicitly mark staleness.
     try:
@@ -537,7 +549,12 @@ def run_agent(
             # forcing final_answer before create_playlist is called.
             creation_pending = (
                 "playlist" in low_goal
+                and not edit_requested
                 and bool(re.search(r"\b(create|make|build|save)\b", low_goal))
+                and not bool(re.search(
+                    r"\b(?:do not|don't|dont|never|without)\s+"
+                    r"(?:create|make|build|save)\b", low_goal,
+                ))
                 and not any(t.get("tool") == "create_playlist" and t.get("ok") for t in trace)
             )
             if creation_pending:
@@ -554,6 +571,24 @@ def run_agent(
                         "Otherwise search for additional artist recordings and verify. "
                         "Currently verified recording IDs: "
                         + json.dumps(verified_options[:12], ensure_ascii=False)
+                    ),
+                })
+            elif edit_requested and not any(
+                t.get("tool") in edit_tool_names and t.get("ok") for t in trace
+            ) and consecutive_no_calls <= 2:
+                # An unstructured text response cannot establish an edit.
+                # Prompt for the next *real* tool call instead of forcing
+                # a final answer immediately.
+                messages.append({
+                    "role": "user",
+                    "content": (
+                        "The user requested an existing-playlist edit, not a "
+                        "new playlist. Existing-playlist editing IS supported. "
+                        "Do not stop after listing playlists. Use get_playlist "
+                        "with the actual playlist UUID, search_recordings with "
+                        "the requested artist, verify_recordings, then "
+                        "add_playlist_tracks with verified MBIDs. "
+                        "Do not claim a write without a successful tool result."
                     ),
                 })
             elif (
@@ -685,10 +720,56 @@ def run_agent(
             final_confidence = args.get("confidence", "high" if proposed_status == "answered" else "low")
             final_sources = list(args.get("sources") or [])
 
+            # A playlist listing is NOT a completed edit. If the model tries
+            # to finish before invoking the authorized append tool, request
+            # another concrete action rather than immediately accepting a
+            # fabricated "not supported" or success explanation.
+            if (edit_requested and step < max_steps
+                    and premature_edit_finals < 2
+                    and not any(t.get("tool") in edit_tool_names and t.get("ok")
+                                for t in trace)):
+                premature_edit_finals += 1
+                _record({
+                    "step": step, "tool": "final_answer", "ok": False,
+                    "error_type": "premature_playlist_edit_final",
+                })
+                messages.append({
+                    "role": "assistant", "content": "", "tool_calls": [call],
+                })
+                messages.append({
+                    "role": "tool", "tool_name": "final_answer",
+                    "content": json.dumps({
+                        "ok": False,
+                        "error_type": "premature_playlist_edit_final",
+                        "message": (
+                            "Existing-playlist editing IS supported and no "
+                            "append was attempted yet. Do not call "
+                            "final_answer until you have tried the actual "
+                            "operation, or have observed a concrete blocker. "
+                            "If find_playlists matched, use get_playlist with "
+                            "the real UUID; otherwise list_playlists and "
+                            "resolve the title. Search the requested artist "
+                            "using search_recordings, verify_recordings for "
+                            "five distinct MBIDs, and call add_playlist_tracks. "
+                            "No user approval or write has occurred."
+                        ),
+                    }),
+                })
+                force_final = False
+                continue
+
             # A successful catalog lookup is not a successful account write.
+            # Negated instructions such as "Do not create a new playlist"
+            # must not be interpreted as a requested account creation.
+            negated_create = re.search(
+                r"\b(?:do not|don't|dont|never|without)\s+"
+                r"(?:(?:want|need)\s+to\s+)?(?:create|make|build|save)\b",
+                low_goal,
+            )
             requested_create = (
-                "playlist" in low_goal and
-                bool(re.search(r"\b(create|make|build|save)\b", low_goal))
+                "playlist" in low_goal
+                and bool(re.search(r"\b(?:create|make|build|save)\b", low_goal))
+                and not bool(negated_create)
             )
             if requested_create and proposed_status == "answered":
                 attempts = [t for t in trace if t.get("tool") == "create_playlist"]
@@ -711,7 +792,10 @@ def run_agent(
             # observed AND its readback matched. A listing with track:[]
             # does not prove a playlist is empty.
             requested_edit = None
-            if "playlist" in low_goal and re.search(r"\b(add|append|insert)\b", low_goal):
+            if "playlist" in low_goal and re.search(
+                r"\b(?:add|adding|append|appending|insert|inserting)\b",
+                low_goal,
+            ):
                 requested_edit = {"add_playlist_tracks", "add_playlist_items"}
             elif "playlist" in low_goal and re.search(r"\b(remove|delete)\b", low_goal):
                 if not re.search(r"\b(?:song|track|recording|item)\b", low_goal):
