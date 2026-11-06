@@ -1,100 +1,87 @@
-# Encore — Music Agent (uv starter)
+# Encore DJ — Concise Student Workbook
 
-Runnable starter project for an agent over your own ListenBrainz account and MusicBrainz. This is an implementation scaffold, **not** a verified live-account deployment. Tests run with mocks, without changing the user's music account.
+## A. Design Decisions
 
-## Setup (from repository root)
+| Question | Answer |
+|---|---|
+| Open-ended trajectory? | Yes. Tool calls depend on the request and API results. |
+| Variable inputs? | Yes. Natural-language requests vary in intent and constraints. |
+| Open output space? | Yes. Answers, recommendations, and playlist edits vary. |
+| Real-world action? | Yes. Approved writes modify ListenBrainz data. |
+| Model | Local Qwen via Ollama; separate execution and final-review tiers. |
+| Tools | ListenBrainz, MusicBrainz, and memory; domain-based routing. |
+| Memory | Working, episodic, semantic, and procedural stores. |
+| Loop | Bounded ReAct loop; configurable step limit and retries. |
+| Termination | Executor sets `answered`, `answered_low_confidence`, `stuck`, `budget_exceeded`, etc. |
 
-```bash
-cp .env.example .env
-# edit LISTENBRAINZ_USER, LISTENBRAINZ_TOKEN, MB_CONTACT
-uv sync --extra dev
-ollama pull qwen3-coder:30b # or set OLLAMA_MODEL to an installed tool-calling model
-uv run encore recent
-uv run encore init-knowledge
-uv run encore eval-retrieval --k 3
-uv run pytest -q
-uv run encore stats artists --range this_month  # direct API/fallback test, no LLM
-uv run encore ask "What are my most-played artists this month?"
-uv run encore ask "Suggest a jazz playlist based on my listens"
-```
+**Memory configuration:** Demonstrated context budget: 12,000 tokens. Compression trigger, recency α, dedup threshold, TTL/cap, and embedding version require code verification. No compressions occurred in the 40 benchmark runs.
 
-### Write examples
+## B. Memory Evidence
 
-```bash
-uv run encore ask "Create a 10-track jazz playlist I haven't played in the last seven days"
-uv run encore ask "Export my playlist 11111111-2222-3333-4444-555555555555 to Spotify"
-```
+| Behavior | Evidence |
+|---|---|
+| Episodic retrieval affected response | 5/5 memory scenarios show retrieval and expected cues; exact trace lines unavailable. |
+| Compression preserved playlist | Not demonstrated; 0 compressions. |
+| `search_music_knowledge` selected | Not verified. |
+| Stale memory questioned | M05 distinguishes old swing from new folk preference. |
+| Polluted summary flagged | `quality_flag=verify_before_using` appears; deliberate test unverified. |
+| Duplicate summary merged | M02 shows `merged=true`; trace unverified. |
+| `--forget` cleared stores | Not verified. |
 
-The write operations request a separate literal `YES` on stdin. You must connect Spotify/Apple Music at https://listenbrainz.org/settings/ first. Approval is never implied from a natural-language request. If the terminal is noninteractive, writes are denied.
+**Semantic retrieval:** Two chunking strategies and top-3 recall scores are not in the supplied evaluation.
 
-## Architecture and assignment mapping
+**1. Episodic summary:** Store reusable preferences and unfinished tasks, not a transcript. M02 preserves a dislike of heavy metal while reading. Add timestamps and distinguish user statements from inferences. An actual stored summary still needs to be pasted.
 
-- **Working memory:** `agent.py` retains model+tool messages for one 12-action run. Not persisted as raw tool output.
-- **Episodic memory:** `memory.py` SQLite sessions; FTS5 retrieval with a 90-day TTL; summaries of completed goals.
-- **Semantic memory:** trusted, versioned Markdown API knowledge, 110-word chunks with 20-word overlap, SQLite FTS5/BM25. Readonly to the agent; `uv run encore init-knowledge` refreshes corpus atomically by source.
-- **Procedural memory:** immutable `SYSTEM` prompt plus hard-coded approval, schema validation, verified MBIDs, action budget, and no automatic write retries.
-- **Preferences:** separate explicitly sourced user statements, with evidence and a `forget_preference` tool.
-- **Evaluation:** `eval-retrieval` computes a small held-out Recall@k baseline. `eval-agent` repeats read-only prompts (tool-invocation proxy accuracy, latency, local-model token cost, outcome variance). Do human scoring for factual answer correctness.
-- **Safety:** `ToolResult` envelopes expose `ok`, `data`, `error_type`, `message`. Classifies `invalid`, `resource`, `transient`, `auth`, `not_found`, `fatal`, `uncertain_write`, `policy_halt`. GET retries are bounded; POST has no automatic retry. A SQLite write ledger blocks replay of the same operation within the run after a timeout/denial. Checks user approval *on every write*.
+**2. Malicious playlist title:** Treat the title as untrusted data, never as a deletion command. Require an explicit request, scope checks, and approval before writes.
 
-Tool router only limits the visible tool menu for simple queries; **the model makes each choice** based on the previous tool result. No preprogrammed action chain.
+**3. Few-shot examples:** Keep tool-selection, verification-before-write, ambiguous-reference, and refusal examples. Exact retained examples require prompt-file verification.
 
-## Known limitations / improvements for submission
+## C. Evaluation Results
 
-1. Verify actual live ListenBrainz + MusicBrainz responses with your own account before writing. Read-only tools are implemented, but only offline mocked tests have been run for this scaffold.
-2. The `get_listens_since` scan is deliberately capped at 1,000 listens (10 pages). When incomplete, Encore must not claim a guaranteed seven-day exclusion. Full history should use ListenBrainz async export rather than unbounded pagination.
-3. Song duration is from MusicBrainz and may be missing. Neither tag nor metadata reliably guarantees instrumental/no vocals; checking against a streaming catalog or curated features would improve results.
-4. The write ledger handles replay only inside a session ID, and records `uncertain` after a write exception; an operator must check ListenBrainz before trying again. This is **not** distributed exactly-once execution across crashed/restarted sessions.
-5. Retrieval is keyword/BM25 baseline, not a tested embedding-hybrid solution; compare chunk settings, recall@k and optionally add embeddings as an ablation. Documentation is a seeded, selectively curated corpus, not a complete API reference.
-6. `eval-agent` is *read only* by design and does not establish factual task success. Record a human-labeled accuracy score and counterbalanced prompts for your final write-up.
-7. Agent may use more than 12 individual **HTTP requests** (one tool can call several APIs); limit applies to LLM tool-action steps.
-8. SQLite stores conversational goals and summaries locally, unencrypted. Do not include sensitive data in prompts. `uv run encore delete-data` removes local records, not remote ListenBrainz content. Secrets stay in `.env` and are excluded from version control.
-9. Read requests to MusicBrainz are held to ~1/s; ListenBrainz GET retries honor Retry-After for 429 but further rate-limit header handling could be improved.
+| Category | Runs | Correct | Incorrect | Ungraded | Mean latency | Mean peak input tokens |
+|---|---:|---:|---:|---:|---:|---:|
+| Happy | 14 | 10 | 4 | 0 | 58.31 s | 2,656 |
+| Boundary | 12 | 4 | 7 | 1 | 56.85 s | 2,960 |
+| Failure | 14 | 11 | 3 | 0 | 30.85 s | 2,071 |
 
-## File tree
+**Overall:** 40 runs; 25 correct, 14 incorrect, 1 ungraded; mean latency **48.26 s**. Recorded API cost: **$0** (local Ollama; hardware costs excluded). Correctness: **25/39 (64.1%)** graded, or **25/40 (62.5%)** counting ungraded as incorrect.
 
-```text
-src/encore/
-  agent.py          # Ollama JSON tool calls + bounded ReAct
-  agent_eval.py     # repeatable read-only agent evaluation
-  clients.py        # ListenBrainz/MusicBrainz HTTP clients
-  config.py         # .env settings
-  memory.py         # SQLite episodic/semantic/preferences + write ledger
-  retrieval_eval.py # Recall@k over held-out queries
-  tools.py          # tool JSON schemas, validation, approval policy
-  cli.py            # entrypoint
-knowledge/          # curated Markdown source (trusted ingestion only)
-evals/              # held-out example inputs
-tests/              # offline tests
-```
+### Three-run variance
 
-## Authoritative documentation
+| Request | Statuses | Tool calls | Same answer? |
+|---|---|---|---|
+| H02 | answered / answered / answered | 1–1 | Yes |
+| H05 | answered / answered / answered | 2–4 | No |
+| B05 | answered_low_confidence / stuck / stuck | 1–1 | No |
+| F01 | answered / answered / answered | 1–1 | Yes |
+| F08 | stuck / stuck / stuck | 1–1 | Yes |
 
-- https://listenbrainz.readthedocs.io/en/latest/users/api/
-- https://listenbrainz.readthedocs.io/en/latest/users/api/playlist.html
-- https://listenbrainz.readthedocs.io/en/latest/users/api/misc.html
-- https://musicbrainz.org/doc/MusicBrainz_API
-- https://docs.ollama.com/capabilities/tool-calling
+### Memory scenarios
 
-## Current-month statistics and fallback
+| Scenario | Session 1 | Session 2 | Episodic read | Expected cues |
+|---|---|---|---|---|
+| M01 | answered | answered_low_confidence | Yes | Yes |
+| M02 | answered | answered | Yes | Yes |
+| M03 | policy_halt | answered | Yes | Yes |
+| M04 | answered | answered_low_confidence | Yes | Yes |
+| M05 | stuck | answered_low_confidence | Yes | Yes |
 
-`this_month` means the current calendar month. `month` is the previous calendar month.
-Set `ENCORE_TIMEZONE` in `.env` (for example, `America/Denver`) to define
-calendar boundaries for the raw-scrobble fallback. When ListenBrainz returns
-empty/204 aggregate stats, `get_top_artists` and `get_top_recordings` automatically
-count scrobbles for `this_month` using at most 10 pages (100 per page).
-If the bounded scan cannot cover the entire month, the result explicitly marks
-`complete: false`; Encore must not present it as a definitive ranking. All other
-periods report a resource error rather than fabricating stats when unavailable.
+Memory-scenario correctness labels are blank; recall cues do not prove overall correctness.
 
-For inspecting an API response without LLM interpretation:
+**Failure 1 — H08:** Artist-relationship request hit `budget_exceeded` after 4 tool calls, 15 LLM calls, and 91.82 s. Reduce redundant calls and terminate when sufficient evidence is available.
 
-```bash
-uv run python - <<'PYEX'
-from encore.config import get_config
-from encore.clients import Http, ListenBrainz
-cfg = get_config()
-lb = ListenBrainz(Http('Encore-Debug/0.1'), cfg.username, cfg.token, timezone_name=cfg.timezone)
-print(lb.top('artists', 10, 'this_month'))
-PYEX
-```
+**Failure 2 — B05:** Prior-preference recall returned one low-confidence answer and two `stuck` outcomes. Improve memory grounding and final-answer fallback.
+
+## D. Final Reflection
+
+**1. Where did Encore forget?** B05 inconsistently used prior preferences: one low-confidence answer and two stuck runs. Memory reads occurred, so the issue appears to be using retrieved information, not proven data loss.
+
+**2. Why separate history and episodic memory?** ListenBrainz history records actual listens; episodic memory stores agent summaries. Separation prevents inferred summaries from becoming authoritative listening facts.
+
+**3. Did tiering pay off?** Tiering may reduce costly model calls, but these evaluations do not isolate its impact. A controlled single-model comparison is needed.
+
+**4. What would make Spotify trustworthy?** Scoped OAuth, approval before writes, change previews, verification, undo capability, audit logs, and secure token handling.
+
+---
+
+*Source: uploaded Encore evaluation archive, as summarized in the supplied workbook draft. Unverified configuration and trace fields remain explicitly marked.*
