@@ -9,6 +9,8 @@ dependencies = [
   "jsonschema>=4.23,<5",
   "ytmusicapi>=1.12.3",
   "chromadb>=1,<2",
+  "wikipedia-mcp==2.0.1",
+  "mcp>=1.20,<2",
 ]
 
 [project.optional-dependencies]
