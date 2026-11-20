@@ -12,7 +12,6 @@ from hashlib import sha256
 from math import log
 from pathlib import Path
 import json
-import re
 
 import requests
 
@@ -27,7 +26,8 @@ class Section:
 
 
 def _slug(value: str) -> str:
-    return re.sub(r"[^a-z0-9]+", "-", value.casefold()).strip("-")
+    text = value.casefold()
+    return '-'.join(''.join(ch if ch.isalnum() else ' ' for ch in text).split())
 
 
 def _words(text: str) -> list[str]:
@@ -35,7 +35,8 @@ def _words(text: str) -> list[str]:
 
 
 def _terms(text: str) -> list[str]:
-    return re.findall(r"[a-z0-9]+(?:[-_/][a-z0-9]+)*", text.casefold())
+    return ''.join(ch if (ch.isalnum() or ch in '-_/') else ' '
+                   for ch in text.casefold()).split()
 
 
 def load_sections(directory: Path) -> list[Section]:
@@ -52,8 +53,13 @@ def load_sections(directory: Path) -> list[Section]:
             body = "\n".join(lines).strip()
             if not body:
                 return
-            url_match = re.search(r"(?m)^Source:\s*(https?://\S+)", body)
-            url = url_match.group(1) if url_match else ""
+            url = ''
+            for line in body.splitlines():
+                if line.startswith('Source:'):
+                    candidate = line.partition(':')[2].strip().split(' ')[0]
+                    if candidate.startswith(('https://', 'http://')):
+                        url = candidate
+                        break
             sid = f"{path.stem}:{_slug(section_title)}"
             sections.append(Section(sid, section_title, path.name, url, body))
         for line in path.read_text(encoding="utf-8").splitlines():

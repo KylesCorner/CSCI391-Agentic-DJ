@@ -10,8 +10,7 @@ from datetime import datetime, timezone
 from hashlib import sha256
 import json
 from pathlib import Path
-import re
-from typing import Any
+from typing import Any, Callable
 
 SENSITIVE_KEYS = frozenset({
     "token", "authorization", "access_token", "refresh_token", "password",
@@ -41,7 +40,8 @@ def sanitize(value: Any, secrets: tuple[str, ...] = (), depth: int = 0) -> Any:
         for secret in secrets:
             if secret:
                 value = value.replace(secret, "[REDACTED]")
-        value = re.sub(r"(?i)(authorization\s*[:=]\s*token\s+)\S+", r"\1[REDACTED]", value)
+        if 'authorization' in value.casefold() or 'bearer ' in value.casefold():
+            return '[REDACTED AUTH STRING]'
         return value
     if value is None or isinstance(value, (bool, int, float)):
         return value
@@ -51,11 +51,13 @@ def sanitize(value: Any, secrets: tuple[str, ...] = (), depth: int = 0) -> Any:
 class SessionTrace:
     """One durable trace file per session; write-through for crash resilience."""
     def __init__(self, root: str | Path, user_id: str, session_id: str,
-                 *, secrets: tuple[str, ...] = ()):
+                 *, secrets: tuple[str, ...] = (),
+                 on_event: Callable[[dict[str, Any]], None] | None = None):
         if not user_id or not session_id:
             raise ValueError("Trace user_id and session_id are required")
         self.session_id = session_id
         self.secrets = secrets
+        self.on_event = on_event
         directory = safe_user_dir(root, user_id)
         directory.mkdir(parents=True, exist_ok=True, mode=0o700)
         self.path = directory / f"session-{session_id}.jsonl"
@@ -72,8 +74,16 @@ class SessionTrace:
             "event": event,
             **fields,
         }
-        self._file.write(json.dumps(sanitize(record, self.secrets), ensure_ascii=False, default=str) + "\n")
+        safe_record = sanitize(record, self.secrets)
+        self._file.write(json.dumps(safe_record, ensure_ascii=False, default=str) + "\n")
         self._file.flush()
+        # Console rendering is best effort; a broken terminal must not stop
+        # the agent, its ledger, or the durable trace.
+        if self.on_event is not None:
+            try:
+                self.on_event(safe_record)
+            except Exception:
+                pass
 
     def close(self) -> None:
         self._file.close()

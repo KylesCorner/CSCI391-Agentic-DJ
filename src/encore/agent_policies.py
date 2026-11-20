@@ -7,273 +7,29 @@ from __future__ import annotations
 
 from dataclasses import asdict
 import json
-import re
 import unicodedata
 
-from .tool_specs import SPECS
+from .tool_specs import SPECS, WRITE_ACTIONS
+from .request_intent import Intent, WRITE_TOOLS
 
 # ============================================================
 # TOOL ROUTER
 # ============================================================
 
-def route(goal: str) -> list[dict]:
+def route(intent: Intent) -> list[dict]:
+    """Offer tools by validated intent and let the model choose read actions.
+
+    No natural-language keywords can grant a write permission.
     """
-    Narrow the available tools for a request.
-
-    The model still chooses its own next action.
-    This does not hardcode an execution sequence.
-    """
-
-    low = goal.casefold()
-
-    # Explanations of API behavior must never be routed to real account writes.
-    # The user saying "How does ... export ...?" is not authorization to export.
-    if re.search(r"^\s*(?:how does|how do|what is|what does|why does|explain|define)\b", low) and any(
-        term in low for term in (
-            "listenbrainz", "musicbrainz", "api", "jspf", "lb radio",
-            "rate limit", "scrobbl", "music glossary", "genre", "export",
-        )
-    ):
-        names = {"search_music_knowledge", "search_knowledge", "final_answer"}
-        return [sp for sp in SPECS if sp["function"]["name"] in names]
-
-    # Assignment-required read/write capabilities. Keep named operations
-    # isolated so the model cannot turn a read into an account mutation.
-    if re.search(r"\b(?:fresh|new|newest|latest|upcoming|recent)\s+releases?\b", low):
-        names = {"get_fresh_releases", "final_answer"}
-        return [sp for sp in SPECS if sp["function"]["name"] in names]
-
-    if re.search(r"\b(?:members?|membership|who(?:'s| is) in|played with|collaborat|lineup)\b", low) and        re.search(r"\b(?:band|quartet|trio|artist|musician|group|who)\b", low):
-        names = {"search_artists", "lookup_artist", "get_top_recordings_for_artist", "final_answer"}
-        return [sp for sp in SPECS if sp["function"]["name"] in names]
-
-    if re.search(r"\b(?:most popular|top recordings|top tracks|biggest songs)\b", low) and        re.search(r"\b(?:artist|by|for)\b", low):
-        names = {"search_artists", "get_top_recordings_for_artist", "final_answer"}
-        return [sp for sp in SPECS if sp["function"]["name"] in names]
-
-    if re.search(r"\b(?:feedback|loved|hated|liked|disliked)\b", low) and        re.search(r"\b(?:what|show|which|list|read|my)\b", low) and not re.search(r"\b(?:set|mark|clear|remove|change)\b", low):
-        names = {"get_feedback", "final_answer"}
-        return [sp for sp in SPECS if sp["function"]["name"] in names]
-
-    if re.search(r"\b(?:mark|set|love|hate|unlove|unhate|clear|remove|rate|thumbs up|thumbs down)\b", low) and        re.search(r"\b(?:song|track|recording|music|feedback|this)\b", low) and not "playlist" in low:
-        names = {"get_feedback", "search_recordings", "lookup_recording", "verify_recordings",
-                 "set_feedback", "final_answer"}
-        return [sp for sp in SPECS if sp["function"]["name"] in names]
-
-    # Whole-playlist deletion must never accidentally route to item removal.
-    if re.search(r"\b(?:delete|remove)\b", low) and re.search(r"\bplaylists?\b", low) and        not re.search(r"\b(?:song|track|recording|item)\b", low):
-        names = {"find_playlists", "get_playlist", "delete_playlist", "final_answer"}
-        return [sp for sp in SPECS if sp["function"]["name"] in names]
-
-    write_intent = (
-        any(
-            word in low
-            for word in (
-                "create",
-                "make",
-                "build",
-                "save",
-                "add",
-                "remove",
-                "delete",
-                "export",
-                "spotify",
-                "apple music",
-                "put on",
-            )
-        )
-        and any(
-            word in low
-            for word in (
-                "playlist",
-                "spotify",
-                "apple music",
-            )
-        )
-    )
-
-    personalized = any(
-        word in low
-        for word in (
-            "my listening",
-            "my plays",
-            "my favorite",
-            "my favourite",
-            "my listens",
-            "my history",
-            "i've played",
-            "i have played",
-            "i listened",
-            "scrobbl",
-            "last week",
-            "recently played",
-        )
-    )
-
-    discovery = (
-        any(
-            word in low
-            for word in (
-                "similar",
-                "find",
-                "discover",
-                "suggest",
-                "recommend",
-            )
-        )
-        and any(
-            word in low
-            for word in (
-                "song",
-                "track",
-                "artist",
-                "jazz",
-                "music",
-                "similar",
-                "recommend",
-                "suggest",
-            )
-        )
-    )
-
-    memory_intent = any(term in low for term in (
-        "preference", "previously", "prior session", "last time",
-        "told you", "what i like", "studying", "study music",
-    ))
-
-    # Route mutations by the action the user actually requested. The model
-    # may choose tools within a domain but cannot choose a different write.
-    if "playlist" in low and re.search(
-        r"\b(?:add|adding|append|appending|insert|inserting)\b", low,
-    ):
-        names = {"list_playlists", "get_playlist", "search_recordings",
-                 "search_artists", "verify_recordings", "lb_radio",
-                 "add_playlist_tracks", "add_playlist_items", "find_playlists", "final_answer"}
-        return [sp for sp in SPECS if sp["function"]["name"] in names]
-
-    if "playlist" in low and re.search(r"\b(remove|delete)\b", low):
-        names = {"list_playlists", "find_playlists", "get_playlist", "remove_playlist_tracks",
-                 "remove_playlist_items", "final_answer"}
-        return [sp for sp in SPECS if sp["function"]["name"] in names]
-
-    # Limit first-time playlist creation to the domains actually needed.
-    # This is tool scoping, not a scripted tool sequence.
-    if "playlist" in low and re.search(r"\b(create|make|build|save)\b", low):
-        names = {
-            "search_recordings", "search_artists", "lb_radio",
-            "verify_recordings", "get_recommendations",
-            "list_playlists", "find_playlists", "get_playlist", "create_playlist",
-            "final_answer",
-        }
-        if memory_intent:
-            names |= {"recall_preferences", "search_past_sessions"}
-        if any(word in low for word in ("minute", "hour", "duration")):
-            names.add("select_playlist_duration")
-        if any(word in low for word in ("haven't played", "last 7 days", "recently played", "heard this week")):
-            names |= {"get_listens_since", "filter_recent_candidates"}
-        return [sp for sp in SPECS if sp["function"]["name"] in names]
-
-    if "playlist" in low and re.search(r"\bexport\b", low) and not re.search(r"\b(?:do not|don.t|without)\s+export", low):
-        names = {"list_playlists", "get_playlist", "export_playlist",
-                 "final_answer"}
-        return [sp for sp in SPECS if sp["function"]["name"] in names]
-
-    # Preferences and music discovery must be routed together. Previously,
-    # the discovery-only route hid recall_preferences from the model.
-    if memory_intent:
-        names = {
-            "recall_preferences", "search_past_sessions",
-            "remember_preference", "note_preference", "forget_preference", "final_answer",
-        }
-        if discovery or "music" in low or "songs" in low or "tracks" in low:
-            names |= {
-                "lb_radio", "search_artists", "search_recordings",
-                "lookup_recording", "verify_recordings",
-                "get_recommendations", "search_knowledge", "search_music_knowledge",
-            }
-        if write_intent:
-            names |= {
-                "list_playlists", "find_playlists", "get_playlist", "create_playlist",
-                "add_playlist_tracks", "add_playlist_items", "remove_playlist_tracks", "remove_playlist_items",
-                "export_playlist", "select_playlist_duration",
-            }
-        return [sp for sp in SPECS if sp["function"]["name"] in names]
-
-    # Focused read-only discovery.
-    if (
-        discovery
-        and not write_intent
-        and not personalized
-        and "playlist" not in low
-    ):
-        names = {
-            "search_artists",
-            "search_recordings",
-            "lookup_artist", "get_top_recordings_for_artist",
-            "lookup_recording",
-            "verify_recordings",
-            "lb_radio",
-            "search_knowledge", "search_music_knowledge",
-            "final_answer",
-        }
-
-        return [
-            spec
-            for spec in SPECS
-            if spec["function"]["name"] in names
-        ]
-
-    # Playlist workflows may need several domains.
-    if any(
-        word in low
-        for word in (
-            "playlist",
-            "recommend",
-            "suggest",
-            "similar",
-            "export",
-            "spotify",
-            "apple music",
-            "discover",
-        )
-    ):
-        return SPECS
-
-    # Listening statistics.
-    if any(
-        word in low
-        for word in (
-            "how many",
-            "most listened",
-            "most played",
-            "top artist",
-            "top song",
-            "top recording",
-            "recent",
-            "played",
-            "listening",
-        )
-    ):
-        names = {
-            "get_recent_listens",
-            "get_listens_since",
-            "get_listen_count",
-            "get_top_artists",
-            "get_top_recordings",
-            "get_playing_now", "get_feedback", "get_fresh_releases",
-            "search_past_sessions",
-            "recall_preferences",
-            "search_knowledge", "search_music_knowledge",
-            "final_answer",
-        }
-
-        return [
-            spec
-            for spec in SPECS
-            if spec["function"]["name"] in names
-        ]
-
-    return SPECS
+    selected = set(intent.allowed_domains)
+    from .router import TOOL_DOMAIN
+    return [tool for tool in SPECS if (
+        tool['function']['name'] == 'final_answer' or
+        (tool['function']['name'] not in WRITE_ACTIONS
+         and tool['function']['name'] not in {name for names in WRITE_TOOLS.values() for name in names}
+         and TOOL_DOMAIN.get(tool['function']['name']) in selected) or
+        tool['function']['name'] in intent.permitted_writes
+    )]
 
 
 # ============================================================
@@ -339,49 +95,16 @@ def compact_observation(name: str, outcome) -> str:
 # REQUEST PARSING
 # ============================================================
 
-def requested_discovery_count(goal: str) -> int | None:
-    """
-    Extract an explicitly requested number of songs.
-
-    Example:
-        Find 5 gypsy jazz songs
-        -> 5
-    """
-
-    low = goal.casefold()
-
-    # Playlist creation needs its own write postcondition, not the
-    # read-only recommendation formatter. Also, "playlist" contains
-    # the substring "list", which must not trigger discovery checks.
-    if "playlist" in low and re.search(r"\b(create|make|build|save)\b", low):
-        return None
-
-    if not re.search(r"\b(?:find|recommend|suggest|give me|list|discover)\b", low):
-        return None
-
-    match = re.search(
-        r"\b(\d{1,2})\s+"
-        r"(?:[\w-]+\s+){0,5}"
-        r"(?:songs?|tunes?|tracks?|recordings?)\b",
-        low,
-    )
-
-    return int(match.group(1)) if match else None
+def requested_discovery_count(intent: Intent) -> int | None:
+    """Get an optional explicit count from the interpreted request."""
+    return intent.track_count if intent.action == 'recommend' else None
 
 
 def _normalize(value: str) -> str:
-    """
-    Normalize artist/title text for comparison.
-    """
-
-    decomposed = unicodedata.normalize(
-        "NFKD",
-        str(value),
-    ).casefold()
-
-    return " ".join(
-        re.findall(r"[\w]+", decomposed)
-    ).strip()
+    """Normalize identifiers and display strings without patterns."""
+    decomposed = unicodedata.normalize('NFKD', str(value)).casefold()
+    normalized = ''.join(ch for ch in decomposed if not unicodedata.category(ch).startswith('M'))
+    return ' '.join(''.join(ch if ch.isalnum() else ' ' for ch in normalized).split())
 
 
 # ============================================================
@@ -475,72 +198,9 @@ def _remember_candidates(
         )
 
 
-def grounded_popularity_answer(goal: str, data: dict) -> tuple[str, list[str]] | None:
-    """Complete a simple N-popular-ARTIST-tunes lookup from observed LB data.
-
-    This is deliberately a narrow, read-only path. More complex recommendations
-    continue through ReAct/final_answer and its grounding checks. No model text,
-    episodic summary, or guessed recording identifier is accepted as evidence.
-    """
-    from uuid import UUID
-
-    request = re.fullmatch(
-        r"\s*(?:(?:can|could|would)\s+you\s+|please\s+)?"
-        r"(?:find|show|give|recommend)\s+(?:me\s+)?"
-        r"(?P<count>[1-9]\d?)\s+(?P<artist>.+?)\s+"
-        r"(?:songs?|tunes?|tracks?|recordings?)\s+"
-        r"(?:(?:that|which)\s+are\s+)?(?:most\s+)?popular\s*[?!.,]*\s*",
-        goal, flags=re.IGNORECASE,
-    )
-    if not request or not isinstance(data, dict):
-        return None
-    artist = request.group("artist").strip()
-    count = int(request.group("count"))
-    if not 1 <= count <= 10 or not 2 <= len(artist) <= 80:
-        return None
-    if re.search(r"\b(?:similar|like|from|between|after|before|instrumental|without|excluding)\b", artist, re.I):
-        return None
-    rows = data.get("recordings")
-    if not isinstance(rows, list):
-        return None
-
-    valid = []
-    seen = set()
-    for item in rows:
-        if not isinstance(item, dict):
-            continue
-        title = item.get("title")
-        credit = item.get("artist")
-        plays = item.get("listen_count")
-        mbid = item.get("mbid")
-        if not (isinstance(title, str) and title.strip()
-                and isinstance(credit, str) and credit.strip()
-                and _normalize(artist) == _normalize(credit)
-                and isinstance(plays, int) and not isinstance(plays, bool)
-                and plays >= 0 and isinstance(mbid, str)):
-            continue
-        try:
-            mbid = str(UUID(mbid))
-        except (ValueError, TypeError, AttributeError):
-            continue
-        key = (_normalize(credit), _normalize(title))
-        if key in seen:
-            continue
-        seen.add(key)
-        valid.append((title.strip(), credit.strip(), plays, mbid))
-
-    if len(valid) < count:
-        return None
-    valid.sort(key=lambda item: item[2], reverse=True)
-    top = valid[:count]
-    lines = [
-        f"{idx}. {title} — {credit} ({plays:,} ListenBrainz listens)"
-        for idx, (title, credit, plays, _) in enumerate(top, 1)
-    ]
-    answer = (f"Here are {count} popular {artist} recordings based on "
-              "the ListenBrainz listen counts returned by the API:\n"
-              + "\n".join(lines))
-    return answer, [mbid for _, _, _, mbid in top]
+def grounded_popularity_answer(intent: Intent, data: dict) -> tuple[str, list[str]] | None:
+    """Generic discovery follows the tool-driven path, not a template matcher."""
+    return None
 
 
 # ============================================================
@@ -548,7 +208,7 @@ def grounded_popularity_answer(goal: str, data: dict) -> tuple[str, list[str]] |
 # ============================================================
 
 def _answer_grounding_error(
-    goal: str,
+    intent: Intent,
     answer: str,
     status: str,
     candidates: dict,
@@ -562,7 +222,7 @@ def _answer_grounding_error(
     does not satisfy "Find 5 songs".
     """
 
-    count = requested_discovery_count(goal)
+    count = requested_discovery_count(intent)
 
     if (
         status != "answered"
@@ -624,28 +284,15 @@ def _answer_grounding_error(
 
 
 def positive_verification_claim(text: str) -> bool:
+    """Conservative plain-token check for unsupported verification claims.
+
+    Prefer structured proof based on verified MBIDs for authoritative checks.
     """
-    Detect affirmative verification claims while allowing
-    statements such as 'not independently verified'.
-    """
-
-    for match in re.finditer(
-        r"\b(?:verified|validated)\b",
-        text,
-        re.IGNORECASE,
-    ):
-        preceding = text[
-            max(0, match.start() - 45):match.start()
-        ]
-
-        negation = re.search(
-            r"\b(?:not|never|without|cannot|can't|unverified)"
-            r"\b.{0,30}$",
-            preceding,
-            re.IGNORECASE,
-        )
-
-        if not negation:
+    words = ''.join(ch.casefold() if ch.isalpha() else ' ' for ch in text).split()
+    for i, word in enumerate(words):
+        if word not in {'verified', 'validated'}:
+            continue
+        if not any(term in {'not','never','without','cannot','unverified'}
+                   for term in words[max(0,i-5):i]):
             return True
-
     return False

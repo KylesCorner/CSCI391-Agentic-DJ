@@ -1,11 +1,9 @@
 """Playlist creation, editing, readback and deletion safeguards.
 
-Keep approval, idempotency, artist verification, duplicate checks and
-ambiguous-write handling unchanged from the original Tools class.
+Account writes depend on typed request intent, explicit approval, verified IDs,
+and readback. Natural-language regexes are not used for authorization.
 """
 from __future__ import annotations
-
-import re
 
 from .clients import ServiceError, check_uuid, mbids_from_track
 
@@ -14,10 +12,8 @@ class PlaylistToolsMixin:
 
     def tool_create_playlist(self, title, mbids, exclude_days=0):
         # Never let the LLM turn a read-only request into an account write.
-        if not ("playlist" in self.goal.casefold() and re.search(
-            r"\b(create|make|build|save)\b", self.goal, re.IGNORECASE
-        )):
-            raise ServiceError("policy_halt", "Current user request did not explicitly authorize playlist creation")
+        if self.intent.action != 'create_playlist':
+            raise ServiceError('policy_halt', 'Creation is not the requested action')
 
         title = str(title).strip()
         if not title or len(title) > 180:
@@ -32,7 +28,7 @@ class PlaylistToolsMixin:
         # An MBID can be real while referring to the wrong artist or to a
         # second recording of the same song. Validate both before approval.
         target_artist = self._requested_playlist_artist()
-        distinct_requested = bool(re.search(r"\bdistinct\b", self.goal, re.I))
+        distinct_requested = self.intent.distinct
         titles = []
         display_tracks = []
         for mbid in cleaned:
@@ -80,9 +76,6 @@ class PlaylistToolsMixin:
             if len(filtered) != len(candidates):
                 raise ServiceError("invalid", "A selected recording was played in the exclusion window")
 
-        # Enforce the ORIGINAL user's duration target even if the model
-        # skipped or ignored select_playlist_duration. Never approve a
-        # 7:55 playlist in response to a 15-minute creation request.
         self._enforce_playlist_duration(cleaned)
 
         # Avoid duplicate remote playlists, including those created in earlier sessions.
@@ -94,8 +87,6 @@ class PlaylistToolsMixin:
             created = self.lb.create_playlist(title, cleaned)  # ONE POST only
             playlist_mbid = created.get("playlist_mbid") or created.get("mbid")
             if not playlist_mbid:
-                # The POST succeeded but the response did not expose its identifier.
-                # Do not blindly POST again; retrieve by title on a later run.
                 return {"created": True, "confirmed": False, "title": title,
                         "track_count_requested": len(cleaned),
                         "warning": "Creation accepted, but no playlist MBID returned; inspect ListenBrainz."}
@@ -144,58 +135,31 @@ class PlaylistToolsMixin:
         if any(len(item) != 1 for item in ids):
             raise ServiceError("resource", "Cannot identify every playlist track by MBID; editing blocked")
 
-        # The user must own the playlist and name the target explicitly.
         creator = entry.get("creator")
         user = getattr(self.lb, "username", None)
-        if creator and user and str(creator).casefold() != str(user).casefold():
-            raise ServiceError("policy_halt", "Cannot edit a playlist owned by another user")
+        if not creator or not user or str(creator).casefold() != str(user).casefold():
+            raise ServiceError("policy_halt", "Cannot confirm playlist ownership; edit blocked")
         if require_named_match:
-            # A playlist edit must identify the exact existing title, even
-            # when its ID was obtained by the model. Keep owner check above.
-            match = re.search(
-                r"\b(?:to|from|in|edit)\s+(?:my\s+|the\s+)?"
-                r"(?P<name>.+?)\s+playlist\b",
-                self.goal, re.I,
-            )
-            # "edit that playlist" refers to the playlist named earlier in
-            # the user's request; "that" is not the actual title.
-            if match and match.group("name").strip().casefold() in {
-                "that", "this", "the", "existing", "same", "that same",
-            }:
-                match = None
-            if not match:
-                match = re.search(
-                    r"\bplaylist\s+(?:named|called|titled)\s+"
-                    r"(?P<name>.+?)"
-                    r"(?=\s+(?:is|was|has|already)\b|[.!?]|$)",
-                    self.goal, re.I,
-                )
-            if not match:
-                raise ServiceError("resource", "Please name the existing playlist to edit")
+            def clean(value: str) -> str:
+                v = str(value).strip().strip('"\'')
+                if v.casefold().startswith('[encore]'):
+                    v = v[len('[encore]'):].lstrip()
+                return ' '.join(v.casefold().split())
 
-            def normalized_name(value: str) -> str:
-                return re.sub(
-                    r"^\[Encore\]\s*", "", value.strip().strip("\"'"),
-                    flags=re.I,
-                ).strip().casefold()
-
-            requested = normalized_name(match.group("name"))
-            actual = normalized_name(str(entry.get("title", "")))
+            requested = clean(self.intent.playlist_name or '')
+            actual = clean(entry.get('title') or '')
             if not requested or requested != actual:
-                raise ServiceError(
-                    "invalid", f"Requested playlist {requested!r}, but selected {actual!r}"
-                )
+                raise ServiceError('invalid', 'Selected playlist does not match the named playlist')
         return {"mbid": playlist_mbid, "title": entry["title"],
                 "tracks": tracks, "mbids": [item[0] for item in ids]}
 
     def _require_edit_request(self, action: str):
-        low = self.goal.casefold()
-        patterns = {
-            "add_playlist_tracks": r"\b(?:add|adding|append|appending|insert|inserting)\b",
-            "remove_playlist_tracks": r"\b(?:remove|removing|delete|deleting)\b",
+        expected = {
+            'add_playlist_tracks': 'add_playlist_tracks',
+            'remove_playlist_tracks': 'remove_playlist_tracks',
         }
-        if not ("playlist" in low and re.search(patterns[action], low)):
-            raise ServiceError("policy_halt", f"User did not request {action}; no write performed")
+        if self.intent.action != expected[action]:
+            raise ServiceError('policy_halt', f'User did not request {action}')
 
     def tool_add_playlist_tracks(self, playlist_mbid, mbids):
         self._require_edit_request("add_playlist_tracks")
@@ -206,12 +170,9 @@ class PlaylistToolsMixin:
         if set(cleaned) & set(snapshot["mbids"]):
             raise ServiceError("resource", "One or more tracks are already in this playlist; nothing added")
 
-        expected = re.search(
-            r"\b(?:add|adding|append|appending|insert|inserting)\s+(\d{1,2})\s+",
-            self.goal, re.I,
-        )
-        if expected and len(cleaned) != int(expected.group(1)):
-            raise ServiceError("invalid", f"User requested {expected.group(1)} tracks; got {len(cleaned)}")
+        expected = self.intent.track_count
+        if expected is not None and len(cleaned) != expected:
+            raise ServiceError('invalid', f'User requested {expected} tracks; got {len(cleaned)}')
 
         # Require requested artist identity, not just a valid recording MBID.
         target = self._requested_playlist_artist()
@@ -230,27 +191,14 @@ class PlaylistToolsMixin:
             titles.append(display_title)
             display_tracks.append(f"{display_title} — {artist or 'artist unconfirmed'}")
 
-        # When the user names an individual song, do not allow an arbitrary
-        # song from the same artist to be substituted.
-        requested_song = re.search(
-            r"\badd\s+(.+?)\s+by\s+.+?\s+to\s+(?:my\s+)?",
-            self.goal, re.I,
-        )
-        # A multi-track quantity is not an individual requested song title.
-        count_request = (
-            requested_song is not None
-            and re.fullmatch(
-                r"\d{1,2}\s+(?:distinct\s+)?(?:recordings?|songs?|tracks?)",
-                requested_song.group(1).strip(), re.I,
-            ) is not None
-        )
-        if requested_song and not count_request:
-            target_title = self._key("", requested_song.group(1))[1]
-            if len(cleaned) != 1 or self._key("", titles[0])[1] != target_title:
-                raise ServiceError("invalid", "Selected recording title does not match the requested song")
+        requested_song = self.intent.track_title
+        if requested_song:
+            target_title = self._key('', requested_song)[1]
+            if len(cleaned) != 1 or self._key('', titles[0])[1] != target_title:
+                raise ServiceError('invalid', 'Selected recording title does not match requested song')
+        if self.intent.distinct and len({self._key('', x)[1] for x in titles}) != len(titles):
+            raise ServiceError('invalid', 'Requested distinct tracks have duplicate titles')
 
-        if "distinct" in self.goal.casefold() and len({x.casefold() for x in titles}) != len(titles):
-            raise ServiceError("invalid", "Requested distinct tracks have duplicate titles")
         # Detect same song as a different MBID where the detail carries names.
         existing_titles = {self._key(x.get("creator"), x.get("title"))
                            for x in snapshot["tracks"] if isinstance(x, dict)}
@@ -289,13 +237,15 @@ class PlaylistToolsMixin:
         before = snapshot["mbids"]
         if not before:
             raise ServiceError("resource", "Playlist is already empty; nothing removed")
-        if re.search(r"\blast\s+(?:song|track|recording)\b", self.goal, re.I):
-            # Ignore the LLM's index; last means last in the REAL detail.
+        if self.intent.position == 'last':
             index, count = len(before) - 1, 1
-        elif re.search(r"\bfirst\s+(?:song|track|recording)\b", self.goal, re.I):
+        elif self.intent.position == 'first':
             index, count = 0, 1
-        elif not re.search(r"\b(?:at\s+)?index\s+\d+\b", self.goal, re.I):
-            raise ServiceError("resource", "Specify first/last track or an explicit zero-based index")
+        elif self.intent.position == 'index':
+            if index != self.intent.position_index:
+                raise ServiceError('invalid', 'Model index differs from the requested index')
+        else:
+            raise ServiceError('resource', 'Specify first, last, or an explicit index')
         if index < 0 or count < 1 or index + count > len(before):
             raise ServiceError("invalid", f"Track range {index}:{index+count} is outside {len(before)} tracks")
         selected = snapshot["tracks"][index:index + count]
@@ -334,11 +284,8 @@ class PlaylistToolsMixin:
 
     def tool_delete_playlist(self, playlist_mbid):
         """Delete an explicitly named Encore-owned playlist, with human approval."""
-        goal = self.goal.casefold()
-        if not re.search(r"\b(delete|remove)\b", goal) or not re.search(r"\bplaylists?\b", goal):
-            raise ServiceError("policy_halt", "User did not request whole-playlist deletion")
-        if re.search(r"\b(?:including|even|also)\b.{0,50}\b(?:not\s+(?:made|created|owned)\s+by\s+encore|non[- ]?encore|other\s+people|everyone)\b", goal):
-            raise ServiceError("policy_halt", "Deletion beyond Encore-created playlists is forbidden")
+        if self.intent.action != 'delete_playlist':
+            raise ServiceError('policy_halt', 'Whole-playlist deletion was not requested')
         playlist_mbid = check_uuid(playlist_mbid)
         raw = self.lb.playlist(playlist_mbid)
         entry = raw.get("payload", raw).get("playlist") if isinstance(raw, dict) else None
@@ -347,12 +294,9 @@ class PlaylistToolsMixin:
         title = str(entry.get("title", "")).strip()
         if not title.startswith("[Encore] "):
             raise ServiceError("policy_halt", "Only Encore-created playlists may be deleted")
-        # A named user request must identify the actual playlist. For an 'all'
-        # request, all candidate playlists must still individually pass owner
-        # and marker checks, each with its own approval.
-        if not re.search(r"\b(all|every|each)\s+(?:my\s+)?playlists?\b", goal):
+        if not self.intent.scope_all:
             cleaned_title = title.removeprefix("[Encore] ").casefold().strip()
-            if cleaned_title and cleaned_title not in goal and title.casefold() not in goal:
+            if cleaned_title != (self.intent.playlist_name or '').casefold().removeprefix('[encore] ').strip():
                 raise ServiceError("invalid", "Requested playlist name does not match the target")
         owner = str(entry.get("creator", "")).strip()
         user = str(getattr(self.lb, "username", "")).strip()

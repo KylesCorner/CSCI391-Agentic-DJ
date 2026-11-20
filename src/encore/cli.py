@@ -1,5 +1,6 @@
 """Command-line entrypoint: uv run encore ..."""
 from __future__ import annotations
+
 import argparse
 import json
 import os
@@ -7,6 +8,7 @@ import shutil
 from uuid import uuid4
 from pathlib import Path
 from datetime import datetime, timezone
+
 from .agent import Ollama, run_agent
 from .clients import Http, ListenBrainz, MusicBrainz
 from .config import get_config
@@ -20,7 +22,7 @@ from .observability import SessionTrace, safe_user_dir
 
 
 def approval(description: str) -> bool:
-    print(f"\nACCOUNT WRITE APPROVAL REQUIRED:\n{description}")
+    print(f"\nACCOUNT WRITE APPROVAL REQUIRED:\n{description}", flush=True)
     try:
         return input("Approve this action? Type YES: ").strip() == "YES"
     except (EOFError, KeyboardInterrupt):
@@ -33,7 +35,9 @@ def main():
     ask = commands.add_parser("ask", help="Run a natural-language goal against the agent")
     ask.add_argument("goal", nargs="+", help="Free-text request")
     ask.add_argument("--steps", type=int, default=12, help="Maximum agent actions (<=12)")
-    ask.add_argument("--debug", action="store_true", help="Include short tool result previews and model no-tool-call text in trace")
+    display_options = ask.add_mutually_exclusive_group()
+    display_options.add_argument("--debug", action="store_true", help="Show detailed live events and the full tool trace")
+    display_options.add_argument("--quiet", action="store_true", help="Print only the final answer to stdout")
     ask.add_argument("--context-budget", type=int, default=8000,
                      help="Approximate model context budget in tokens; compression triggers at 70 percent")
     ask.add_argument("--inject", type=Path,
@@ -61,15 +65,14 @@ def main():
     cfg = get_config()
     trace_root = Path(os.getenv("ENCORE_TRACE_DIR", "./traces"))
     session_trace = None
+    ui = None
     mem = Memory(cfg.db)
     mem.prune(days=90)
     # Public semantic knowledge is independent from user-scoped episodic memory.
-    # Keep the collection separate even when the same Chroma directory is used.
     if args.command in {"ask", "init-knowledge", "eval-retrieval"}:
         mem.enable_semantic(SemanticStore(
             cfg.episodic_path, OllamaEmbedder(cfg.ollama_host, cfg.embedding_model)
         ))
-    # For ask/episodes/deletion use the real user-scoped Chroma store.
     if args.command in {"ask", "episodes", "prune-episodes", "delete-data", "forget"}:
         store = EpisodicStore(
             cfg.episodic_path, cfg.user_id,
@@ -94,9 +97,9 @@ def main():
             output_path = Path(args.output)
             output_path.parent.mkdir(parents=True, exist_ok=True)
             output_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
-            print(json.dumps({"report":str(output_path),
-                              "recall_at_k":{k:v["recall_at_k"] for k,v in report["strategies"].items()},
-                              "n":report["question_count"],"k":args.k},indent=2))
+            print(json.dumps({"report": str(output_path),
+                              "recall_at_k": {k: v["recall_at_k"] for k, v in report["strategies"].items()},
+                              "n": report["question_count"], "k": args.k}, indent=2))
             return
         if args.command == "prune-episodes":
             when = datetime.fromisoformat(args.now.replace("Z", "+00:00")) if args.now else datetime.now(timezone.utc)
@@ -130,9 +133,15 @@ def main():
                 parser.error(f"Invalid --inject file: {exc}")
             if injection and injection.max_steps is not None:
                 args.steps = injection.max_steps
+
+            # Rich is only needed by `ask`; the other commands remain unchanged.
+            from .terminal_ui import TerminalUI, ObservableOllama
+            ui = TerminalUI(quiet=args.quiet, debug=args.debug)
+            goal = " ".join(args.goal)
+            ui.start(goal)
             session_trace = SessionTrace(
                 trace_root, cfg.user_id or cfg.username, str(uuid4()),
-                secrets=(cfg.token,),
+                secrets=(cfg.token,), on_event=ui.on_event,
             )
             session_trace.emit("session_start", command="ask", max_steps=args.steps,
                                model=cfg.model, summary_model=cfg.summary_model,
@@ -147,6 +156,7 @@ def main():
                                    seed=injection.seed, max_steps=injection.max_steps)
         else:
             injection = None
+
         http = Http("Encore-Educational/0.1 (ListenBrainz music-class project)",
                     injector=injection,
                     reporter=session_trace.emit if session_trace is not None else None)
@@ -168,7 +178,7 @@ def main():
                                     tasks, repeats=args.repeats)
             print(json.dumps(output, indent=2))
             return
-        goal = " ".join(args.goal)
+
         def traced_approval(description: str) -> bool:
             approved = approval(description)
             session_trace.emit("approval", approved=approved, action=description[:800],
@@ -177,17 +187,17 @@ def main():
 
         tools = Tools(lb, mb, mem, approve=traced_approval,
                       current_goal=goal, session_id=session_trace.session_id)
-        result = run_agent(goal, tools, Ollama(cfg.ollama_host, cfg.model, cfg.summary_model,
+        result = run_agent(goal, tools, ObservableOllama(cfg.ollama_host, cfg.model, cfg.summary_model,
                                               cheap_model=cfg.cheap_model,
                                               final_model=cfg.final_model,
-                                              router_model=cfg.router_model),
+                                              router_model=cfg.router_model,
+                                              on_model_event=session_trace.emit),
                            max_steps=args.steps, trace_data=args.debug,
                            context_budget_tokens=args.context_budget,
                            event_log=session_trace,
                            retry_seed=injection.seed if injection else 0,
                            max_read_attempts=args.read_attempts)
-        # Always attempt to save a structured episode, including unsuccessful
-        # runs. Never mistake free-form final_answer text for a session summary.
+        # Always attempt a structured episodic memory, including unsuccessful runs.
         safe_goal = _strip_secrets(goal, (cfg.token,))
         safe_answer = _strip_secrets(result.answer, (cfg.token,))
         summarizer = SessionSummarizer(
@@ -204,35 +214,32 @@ def main():
         except Exception as exc:
             session_trace.emit("memory_summary_end", success=False, model=cfg.summary_model,
                                tier="cheap", error_category=type(exc).__name__)
-            print(f"[episodic] LLM summary/quality call failed: {type(exc).__name__}. "
-                  "Saving a low-trust fallback rather than fabricating memory.")
+            ui.warning(f"[episodic] LLM summary/quality call failed: {type(exc).__name__}; saving a low-trust fallback")
             episode_summary = {key: [] for key in SUMMARY_FIELDS}
             episode_summary["open_threads"] = [f"Request: {safe_goal[:350]} | Outcome: {result.status}"]
             episode_summary["errors"] = [f"Summary/check unavailable: {type(exc).__name__}"]
             episode_review = {"consistent": False, "score": 0.0, "issues": ["Summary model unavailable"]}
         try:
-            # Do not persist credentials even if the model unexpectedly echoes one.
             episode_summary = json.loads(_strip_secrets(json.dumps(episode_summary), (cfg.token,)))
             episode_result = mem.add_structured_session(safe_goal, episode_summary, result.status, episode_review)
             session_trace.emit("memory_write", success=True, store="episodic",
                                quality_flag=episode_result.get("quality_flag"),
                                merged=episode_result.get("merged"))
-            print("Episodic memory:", json.dumps(episode_result, ensure_ascii=False))
         except Exception as exc:
             session_trace.emit("memory_write", success=False, store="episodic",
                                error_category=type(exc).__name__)
-            print(f"[episodic] Memory write FAILED: {type(exc).__name__}: {exc}")
-        print(f"\n{result.answer}\n")
-        print(f"Status: {result.status} | confidence: {result.confidence} | actions: {result.steps} | seconds: {result.seconds}")
-        if result.sources:
-            print("Sources:", json.dumps(result.sources[:15], ensure_ascii=False))
-        print(f"Ollama tokens: prompt={result.prompt_tokens}, generated={result.generated_tokens} (local, no API billing)")
-        print("Tool trace:", json.dumps(result.tool_trace, indent=2))
+            ui.warning(f"[episodic] Memory write FAILED: {type(exc).__name__}: {exc}")
+
         session_trace.emit("session_end", status=result.status,
                            actions=result.steps, latency_s=result.seconds,
                            tokens_in=result.prompt_tokens, tokens_out=result.generated_tokens)
-        print("Saved trace:", session_trace.path)
+        ui.result(result, session_trace.path)
+        if args.debug:
+            # Keep the old --debug diagnostics without cluttering normal output.
+            print("Tool trace:", json.dumps(result.tool_trace, indent=2, ensure_ascii=False))
     finally:
+        if ui is not None:
+            ui.close()
         if session_trace is not None:
             session_trace.close()
         mem.close()

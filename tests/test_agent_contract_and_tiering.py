@@ -1,37 +1,31 @@
 """Assignment contract: enum router, tier usage, final schema and source validation.
-No external network calls or account writes.
+No external network calls or account writes. Structured intent replaces text parsing.
 """
 import json
 from uuid import uuid4
-
 import pytest
 from jsonschema import ValidationError
 
 from encore.agent import Ollama, run_agent
 from encore.memory import Memory
-from encore.router import (
-    DOMAINS, DOMAIN_SCHEMA, TOOL_DOMAIN, validate_domains, tools_for_domains,
-)
-from encore.tools import INDEX, SPECS, Tools
+from encore.router import DOMAIN_SCHEMA, TOOL_DOMAIN, validate_domains, tools_for_domains
+from encore.tools import INDEX, Tools
+from encore.request_intent import Intent
+from test_router_intent_integration import intent_payload
 
 
 class Response:
-    def __init__(self, data):
-        self.data = data
-    def raise_for_status(self):
-        pass
-    def json(self):
-        return self.data
+    def __init__(self, data): self.data = data
+    def raise_for_status(self): pass
+    def json(self): return self.data
 
 
 def test_all_tools_classified_and_router_is_strict():
     assert set(INDEX) <= set(TOOL_DOMAIN)
     assert validate_domains({'domains': ['catalog', 'memory']}) == ('catalog', 'memory')
     for malformed in [
-        {'domains': ['catalog', 'catalog']},
-        {'domains': ['other']},
-        {'domains': ['none', 'library']},
-        {'domains': []},
+        {'domains': ['catalog', 'catalog']}, {'domains': ['other']},
+        {'domains': ['none', 'library']}, {'domains': []},
         {'domains': ['catalog'], 'extra': True},
     ]:
         with pytest.raises(ValidationError):
@@ -40,9 +34,12 @@ def test_all_tools_classified_and_router_is_strict():
 
 def test_routed_domains_never_broaden_write_permissions():
     from encore.agent import route
-    allowed = route('Add a recording to my Swing Test playlist')
-    result = tools_for_domains(allowed, ('library', 'catalog'))
-    names = {s['function']['name'] for s in result}
+    intended = Intent.from_dict(intent_payload(
+        action='add_playlist_tracks', playlist_name='Swing Test', explicit=True,
+        domains=['catalog', 'library'],
+    ))
+    allowed = route(intended)
+    names = {s['function']['name'] for s in tools_for_domains(allowed, ('library', 'catalog'))}
     assert 'create_playlist' not in names
     assert 'delete_playlist' not in names
     assert 'add_playlist_items' in names
@@ -86,8 +83,7 @@ def test_ollama_finalizer_uses_expensive_model_and_output_schema(monkeypatch):
 
 class CountLB:
     token = ''
-    def count(self):
-        return {'count': 42}
+    def count(self): return {'count': 42}
 
 
 class RoutedMock:
@@ -104,12 +100,14 @@ class RoutedMock:
         names = {s['function']['name'] for s in tools}
         if self.step == 1:
             assert 'get_listen_count' in names
-            return {'message': {'tool_calls': [{'function': {'name': 'get_listen_count', 'arguments': {}}}]},
-                    'prompt_eval_count': 30, 'eval_count': 10}
+            return {'message': {'tool_calls': [{'function': {
+                'name': 'get_listen_count', 'arguments': {},
+            }}]}, 'prompt_eval_count': 30, 'eval_count': 10}
         return {'message': {'tool_calls': [{'function': {
-            'name': 'final_answer',
-            'arguments': {'answer': '42 listens were observed', 'status': 'answered',
-                          'confidence': 'high', 'sources': []},
+            'name': 'final_answer', 'arguments': {
+                'answer': '42 listens were observed', 'status': 'answered',
+                'confidence': 'high', 'sources': [],
+            },
         }}]}, 'prompt_eval_count': 30, 'eval_count': 10}
 
 
@@ -118,8 +116,7 @@ def test_run_agent_uses_model_router_and_safe_fallback(tmp_path, fail):
     mem = Memory(tmp_path / 'db.sqlite')
     events = []
     class EventLog:
-        def emit(self, event, **kw):
-            events.append((event, kw))
+        def emit(self, event, **kw): events.append((event, kw))
     try:
         tools = Tools(CountLB(), None, mem, approve=lambda _: False,
                       current_goal='How many listens?', session_id=str(uuid4()))
@@ -132,15 +129,16 @@ def test_run_agent_uses_model_router_and_safe_fallback(tmp_path, fail):
         assert routes[0]['routing_strategy'] == (
             'all_domains_fallback_safety_scoped' if fail else 'ollama_schema')
         assert result.prompt_tokens == (60 if fail else 77)
-    finally:
-        mem.close()
+    finally: mem.close()
 
 
 def test_legacy_final_tool_call_gets_required_metadata(tmp_path):
     class LegacyModel:
         def chat(self, messages, tools):
-            return {'message': {'tool_calls': [{'function': {'name': 'final_answer',
-                'arguments': {'status': 'answered', 'answer': 'Hello'}}}]}}
+            return {'message': {'tool_calls': [{'function': {
+                'name': 'final_answer',
+                'arguments': {'status': 'answered', 'answer': 'Hello'},
+            }}]}}
     mem = Memory(tmp_path / 'db.sqlite')
     try:
         tools = Tools(CountLB(), None, mem, approve=lambda _: False,
@@ -150,10 +148,9 @@ def test_legacy_final_tool_call_gets_required_metadata(tmp_path):
         assert result.confidence == 'medium'
         assert result.sources == []
         assert set(INDEX['final_answer']['function']['parameters']['required']) == {
-            'answer', 'status', 'confidence', 'sources'
+            'answer', 'status', 'confidence', 'sources',
         }
-    finally:
-        mem.close()
+    finally: mem.close()
 
 
 def test_ollama_chat_switches_model_by_tier(monkeypatch):
@@ -170,8 +167,10 @@ def test_ollama_chat_switches_model_by_tier(monkeypatch):
 
 
 def test_feedback_write_remains_accessible_if_router_misses_library(tmp_path):
-    from encore.agent import route
     class Misclassified(RoutedMock):
+        def extract_intent(self, goal):
+            return intent_payload(action='set_feedback', explicit=True,
+                                  feedback_score=1, domains=['catalog'])
         def route_domains(self, goal):
             return ('catalog',), {'model': 'misrouter', 'tokens_in': 1, 'tokens_out': 1}
         def chat(self, messages, specs):
@@ -182,11 +181,10 @@ def test_feedback_write_remains_accessible_if_router_misses_library(tmp_path):
                 'arguments': {'status': 'answered', 'answer': 'I loved the recording',
                               'confidence': 'high', 'sources': []},
             }}]}}
-    mem = Memory(tmp_path/'db.sqlite')
+    mem = Memory(tmp_path / 'db.sqlite')
     try:
         tools = Tools(CountLB(), None, mem, approve=lambda _: False,
                       current_goal='Love this recording', session_id=str(uuid4()))
         result = run_agent('Love this recording', tools, Misclassified())
         assert result.status == 'stuck'
-    finally:
-        mem.close()
+    finally: mem.close()

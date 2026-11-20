@@ -4,7 +4,6 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import hashlib
 import json
-import re
 import sqlite3
 import uuid
 import shutil
@@ -24,7 +23,7 @@ def chunks(text: str, size: int = 110, overlap: int = 20) -> list[str]:
 
 def fts_query(text: str) -> str:
     # Quoted terms avoid exposing raw FTS syntax to untrusted user input.
-    terms = re.findall(r"[\w]+", text.lower(), flags=re.UNICODE)[:12]
+    terms = ''.join(ch.lower() if ch.isalnum() else ' ' for ch in text).split()[:12]
     return " OR ".join(f'"{term}"' for term in terms if len(term) >= 3)
 
 
@@ -64,7 +63,8 @@ class Memory:
           INSERT INTO knowledge_fts(rowid,text) VALUES(new.rowid,new.text);
         END;
         CREATE TRIGGER IF NOT EXISTS knowledge_ad AFTER DELETE ON knowledge BEGIN
-          INSERT INTO knowledge_fts(knowledge_fts,rowid,text) VALUES('delete',old.rowid,old.text);
+          INSERT INTO knowledge_fts(knowledge_fts,rowid,text)
+          VALUES('delete',old.rowid,old.text);
         END;
         CREATE TABLE IF NOT EXISTS writes (
           op_id TEXT PRIMARY KEY, action TEXT NOT NULL, state TEXT NOT NULL,

@@ -4,13 +4,13 @@ from dataclasses import dataclass, asdict
 from hashlib import sha256
 from typing import Any, Callable
 import json
-import re
 from uuid import uuid4
 from jsonschema import validate, ValidationError
 from .clients import ListenBrainz, MusicBrainz, ServiceError, check_uuid, mbids_from_track
 from .memory import Memory
 from .tool_specs import spec, s, n, arr, SPECS, INDEX, WRITE_ACTIONS
 from .playlist_tools import PlaylistToolsMixin
+from .request_intent import Intent, WRITE_TOOLS, INSTRUMENT_NAMES, GENRE_NAMES, _descriptor
 
 
 
@@ -33,6 +33,7 @@ class Tools(PlaylistToolsMixin):
         self.approve = approve
         self.goal = current_goal
         self.session_id = session_id or str(uuid4())
+        self.intent = Intent()
         self.verified: dict[str, dict] = {}
         self.last_candidates: list[dict] = []
         self.recent_cache: dict[int, dict] = {}
@@ -46,9 +47,9 @@ class Tools(PlaylistToolsMixin):
 
     @staticmethod
     def _key(artist: str | None, title: str | None) -> tuple[str, str]:
-        def norm(x):
-            return re.sub(r"[^\w]+", "", (x or "").casefold())
-        return norm(artist), norm(title)
+        def normalize(value: str | None) -> str:
+            return ''.join(ch for ch in (value or '').casefold() if ch.isalnum())
+        return normalize(artist), normalize(title)
 
     def _exclude(self, candidates: list[dict], days: int) -> list[dict]:
         history = self._recent(days)
@@ -62,6 +63,8 @@ class Tools(PlaylistToolsMixin):
         )]
 
     def _write(self, action: str, args: dict, callback, *, summary: str | None = None) -> dict:
+        if action not in self.intent.permitted_writes:
+            raise ServiceError('policy_halt', 'This operation was not explicitly authorized')
         if not self.lb.token:
             raise ServiceError("auth", "Set LISTENBRAINZ_TOKEN for account writes")
         # Stable across sessions for playlist creation; session-scoped for edits.
@@ -138,6 +141,8 @@ class Tools(PlaylistToolsMixin):
         return cleaned
 
     def run(self, name: str, args: dict) -> ToolResult:
+        if name in {item for names in WRITE_TOOLS.values() for item in names} and name not in self.intent.permitted_writes:
+            return ToolResult(False, error_type='policy_halt', message='Write not authorized by request intent')
         if name not in INDEX or name == "final_answer":
             return ToolResult(False, error_type="invalid", message=f"Unknown/non-executable tool {name}")
         try:
@@ -220,94 +225,43 @@ class Tools(PlaylistToolsMixin):
 
     @staticmethod
     def _is_generic_music_descriptor(query: str) -> bool:
-        """Descriptors are not artist identities; reject ambiguous seed searches."""
-        clean = re.sub(r"[\W_]+", " ", query.casefold()).strip()
-        return clean in {
-            "instrumental", "instrumental jazz", "swing", "swing jazz",
-            "jazz", "study", "study music", "focus music", "relaxing",
-            "background music", "music for studying", "acoustic", "no vocals",
-        }
+        """Recognize category names, not artist identities."""
+        clean = _descriptor(query)
+        return clean in (set(INSTRUMENT_NAMES) | set(GENRE_NAMES) | {
+            'instrumental', 'instrumental jazz', 'study', 'study music',
+            'focus music', 'relaxing', 'background music',
+            'music for studying', 'acoustic', 'no vocals',
+        })
+
+    @staticmethod
+    def _catalog_tag_query(instrument: str | None, genre: str | None) -> str:
+        """MusicBrainz has a recording tag: field, not instrument:/genre:.
+
+        Both tags are metadata hints, not proof of audible instrumentation.
+        """
+        def quote(value: str) -> str:
+            return value.replace('\\', '\\\\').replace('"', '\\"')
+        def safe_label(value: str) -> str:
+            # Tags are words, not Lucene field expressions.
+            return ' '.join(''.join(ch if ch.isalnum() or ch in ' -' else ' '
+                                    for ch in value).split())[:60]
+        tags = []
+        if genre:
+            tags.append(GENRE_NAMES.get(_descriptor(genre), safe_label(genre)))
+        if instrument:
+            tags.append(INSTRUMENT_NAMES.get(_descriptor(instrument), safe_label(instrument)))
+        tags = [tag for tag in tags if tag]
+        return ' AND '.join(f'tag:"{quote(tag)}"' for tag in dict.fromkeys(tags))
 
     def _requested_playlist_artist(self) -> str | None:
-        """Extract an explicit performer constraint from a playlist goal.
-
-        E.g. 'playlist ... with 5 distinct Benny Goodman recordings'.
-        Do not guess an artist from a genre-only request.
-        """
-        if not re.search(r"\bplaylist\b", self.goal, re.I):
-            return None
-
-        # A count describes the number of songs, not the artist or a title.
-        # E.g. "Add 5 distinct recordings by Edmond Hall to my playlist."
-        by_artist = re.search(
-            r"\b(?:recordings?|songs?|tracks?)\s+by\s+"
-            r"(?P<artist>.+?)"
-            r"(?=\s+(?:to|into|in)\s+(?:my\s+|the\s+)?|[.!?]|$)",
-            self.goal, re.I,
-        )
-        if by_artist:
-            artist = by_artist.group("artist").strip()
-            if artist and not self._is_generic_music_descriptor(artist):
-                return artist
-
-        match = re.search(
-            r"\b(?:with|of)\s+\d{1,2}\s+(?:distinct\s+)?"
-            r"(?P<artist>[\w&'’.-]+(?:\s+[\w&'’.-]+){0,4}?)\s+"
-            r"(?:recordings?|songs?|tracks?)\b",
-            self.goal,
-            re.I,
-        )
-        if not match:
-            match = re.search(
-                r"\b(?:add|adding|append|appending|insert|inserting)\s+\d{1,2}\s+(?:distinct\s+)?"
-                r"(?P<artist>[\w&'’.-]+(?:\s+[\w&'’.-]+){0,4}?)\s+"
-                r"(?:recordings?|songs?|tracks?)\b",
-                self.goal, re.I,
-            )
-        if not match:
-            match = re.search(
-                r"\b(?:find|select|choose)\s+\d{1,2}\s+(?:distinct\s+)?"
-                r"(?P<artist>[\w&'’.-]+(?:\s+[\w&'’.-]+){0,4}?)\s+"
-                r"(?:recordings?|songs?|tracks?)\b",
-                self.goal, re.I,
-            )
-        if not match:
-            by = re.search(r"\bby\s+(.+?)\s+to\s+(?:my\s+)?", self.goal, re.I)
-            if by:
-                artist = by.group(1).strip()
-                return None if self._is_generic_music_descriptor(artist) else artist
-            return None
-        artist = match.group("artist").strip()
-        if self._is_generic_music_descriptor(artist):
-            return None
-        return artist
+        return self.intent.artist if self.intent.action in {
+            'create_playlist', 'add_playlist_tracks', 'recommend', 'read'} else None
 
     def _requested_playlist_track_count(self) -> int | None:
-        """Number of tracks explicitly required by the ORIGINAL playlist goal.
-
-        Never infer the number from a model-selected subset. Read-only
-        recommendations are handled separately in the agent.
-        """
-        if not re.search(r"\bplaylist\b", self.goal, re.I):
-            return None
-        match = re.search(
-            r"\b(\d{1,2})\s+(?:[\w-]+\s+){0,5}(?:songs?|tracks?|recordings?)\b",
-            self.goal, re.I,
-        )
-        if not match:
-            match = re.search(r"\b(\d{1,2})\s*[- ]\s*track\s+playlist\b", self.goal, re.I)
-        return int(match.group(1)) if match else None
+        return self.intent.track_count
 
     def _requested_duration_minutes(self) -> int | None:
-        """Read a numeric minute requirement from the original user goal.
-
-        Examples: '15-minute playlist', '15 minute playlist', '20 mins'.
-        This is deliberately NOT inferred from the model's tool arguments.
-        """
-        match = re.search(r"\b(\d{1,3})\s*(?:-\s*)?(?:minutes?|mins?)\b", self.goal, re.I)
-        if match and int(match.group(1)) > 0:
-            return int(match.group(1))
-        return None
+        return self.intent.duration_minutes
 
     @staticmethod
     def _duration_string(duration_ms: int) -> str:
@@ -347,149 +301,97 @@ class Tools(PlaylistToolsMixin):
             )
 
     def tool_search_recordings(self, query):
-        """Search actual artist credits, not recordings named after an artist."""
-        target = self._requested_playlist_artist()
-        by_match = re.search(
-            r"\b(?:recordings?|songs?|tracks?)\s+by\s+(.+?)(?=[.!?]|$)",
-            self.goal,
-            re.I,
-        )
-        if not target and by_match:
-            target = by_match.group(1).strip()
+        """Search recordings using entity-typed constraints, never guessed fields.
 
-        generic_artist = re.search(
-            r'\b(?:artist|artistname):\s*"?([^"\)]+)', query, re.I
-        )
-        if not target and (
-            self._is_generic_music_descriptor(query)
-            or (generic_artist and self._is_generic_music_descriptor(generic_artist.group(1)))
-        ):
-            raise ServiceError(
-                "resource",
-                "A genre or mood is not an artist. Use LB Radio or a named performer.",
-            )
+        An instrument is not an artist; a style is not a recording title. The
+        MusicBrainz tag index can suggest candidates, but does not establish
+        that a specific instrument is audible on the recording.
+        """
+        target = self.intent.artist
+        track = self.intent.track_title
+        instrument = self.intent.instrument
+        genre = self.intent.genre
 
-        # User's explicit artist constraint has precedence over model-supplied
-        # title searches such as recording:"Benny Goodman".
+        def quote(value):
+            return str(value).replace('\\', '\\\\').replace('"', '\\"')
+
         if target:
-            safe = target.replace("\\", "\\\\").replace('"', '\\"')
-            specific_song = re.search(
-                r"\badd\s+(.+?)\s+by\s+.+?\s+to\s+(?:my\s+)?",
-                self.goal, re.I,
-            )
-            # "Add 5 distinct recordings by Artist" is NOT a song title.
-            # Only force a recording: predicate for an actual named song.
-            count_request = (
-                specific_song is not None
-                and re.fullmatch(
-                    r"\d{1,2}\s+(?:distinct\s+)?(?:recordings?|songs?|tracks?)",
-                    specific_song.group(1).strip(), re.I,
-                ) is not None
-            )
-            if count_request or (
-                specific_song is None
-                and self._requested_playlist_track_count() is not None
-                and re.search(r"\b(?:add|adding|append|appending|insert|inserting)\b", self.goal, re.I)
-            ):
-                # The model may itself have guessed recording:"5 distinct recordings".
-                # Discard that spurious title predicate for multi-track requests.
-                query = f'artist:"{safe}"'
-            elif specific_song:
-                requested_title = specific_song.group(1).strip()
-                escaped_title = requested_title.replace("\\", "\\\\").replace('"', '\\"')
-                query = f'recording:"{escaped_title}" AND artist:"{safe}"'
-            elif re.search(r"\brecording:\s*", query, re.I):
-                # Preserve the model's specific song-title predicate and
-                # append the artist. Don't collapse it into artist-only search.
-                title_predicate = re.search(r'recording:\s*(?:"[^"]+"|[^\s]+)', query, re.I)
-                query = (f'{title_predicate.group(0)} AND artist:"{safe}"'
-                         if title_predicate else f'artist:"{safe}"')
-            else:
-                query = f'artist:"{safe}"'
+            predicates = [f'artist:"{quote(target)}"']
+            if track:
+                predicates.append(f'recording:"{quote(track)}"')
+            query = ' AND '.join(predicates)
+        elif track:
+            query = f'recording:"{quote(track)}"'
+        elif instrument or genre:
+            # Discard model-authored artist:"clarinet" AND recording:"swing jazz"
+            # instead of blindly forwarding it to MusicBrainz.
+            query = self._catalog_tag_query(instrument, genre)
+        else:
+            # Failsafe when intent extraction is unavailable: inspect only
+            # known MusicBrainz field names, without regex or arbitrary text
+            # inference. Never send a fake artist/recording entity to the API.
+            misplaced_instrument = None
+            misplaced_genre = None
+            for clause in query.split(' AND '):
+                field, separator, raw_value = clause.partition(':')
+                if not separator:
+                    continue
+                label = _descriptor(raw_value.strip().strip('"'))
+                if field.strip().casefold() in {'artist', 'artistname'} and label in INSTRUMENT_NAMES:
+                    misplaced_instrument = INSTRUMENT_NAMES[label]
+                if field.strip().casefold() == 'recording' and label in GENRE_NAMES:
+                    misplaced_genre = label
+            if misplaced_instrument or misplaced_genre:
+                instrument = misplaced_instrument
+                genre = misplaced_genre
+                query = self._catalog_tag_query(instrument, genre)
+            elif self._is_generic_music_descriptor(query):
+                raise ServiceError('resource', 'An instrument or genre is not an artist or song title. '
+                                   'Use recording tags or a music discovery tool.')
 
-        self.last_recording_query = query  # safe debug metadata, never the token
+        self.last_recording_query = query
         data = self._catalog().search(query)
-        rows = list(data.get("recordings", []))
-
-        # Genre-specific MusicBrainz recording metadata is sparse. If a
-        # constrained artist+genre query cannot supply even the requested
-        # minutes, make a second, broader artist search so the model can
-        # verify more candidates. This does NOT establish genre membership.
-        target_minutes = self._requested_duration_minutes()
-        search_artist_match = re.search(
-            r'\bartist:\s*(?:"([^"]+)"|(.+?)(?=\s+AND\b|$))',
-            query, re.I,
-        )
-        searched_artist = (
-            (search_artist_match.group(1) or search_artist_match.group(2) or "").strip()
-            if search_artist_match else ""
-        )
-        known_ms = sum(
-            x.get("length") for x in rows
-            if isinstance(x.get("length"), int) and x["length"] > 0
-        )
-        if (target_minutes and searched_artist and
-                re.search(r'\bgenre:', query, re.I) and
-                known_ms < max(0, target_minutes * 60_000 - 60_000)):
-            escaped = searched_artist.replace("\\", "\\\\").replace('"', '\\"')
-            fallback_query = f'artist:"{escaped}"'
-            broadened = self._catalog().search(fallback_query)
-            rows.extend(broadened.get("recordings", []))
-            self.last_recording_query += f' | fallback: {fallback_query}'
-
-        recordings = []
+        rows = list(data.get('recordings') or [])
+        found = []
         seen = set()
-        artist_constraint = target or (searched_artist if target_minutes and searched_artist else None)
         for item in rows:
-            artist = "".join(
-                credit.get("name", "") + credit.get("joinphrase", "")
-                for credit in item.get("artist-credit", [])
-                if isinstance(credit, dict)
+            artist = ''.join(
+                credit.get('name', '') + credit.get('joinphrase', '')
+                for credit in item.get('artist-credit', []) if isinstance(credit, dict)
             ).strip()
-            title = str(item.get("title") or "").strip()
-            mbid = item.get("id")
+            title = str(item.get('title') or '').strip()
+            mbid = item.get('id')
             if not title or not artist or not mbid:
                 continue
-            if artist_constraint and artist_constraint.casefold() not in artist.casefold():
+            if target and target.casefold() not in artist.casefold():
                 continue
-            # For an explicit distinct-song request, suppress different
-            # recordings of the same title so the model sees real variety.
-            identity = (artist.casefold(), title.casefold())
+            identity = self._key(artist, title)
             if identity in seen:
                 continue
             seen.add(identity)
-            entry = {
-                "mbid": mbid,
-                "title": title,
-                "artist": artist,
-                "score": item.get("score"),
-                "length_ms": item.get("length"),
-            }
+            entry = {'mbid': mbid, 'title': title, 'artist': artist,
+                     'score': item.get('score'), 'length_ms': item.get('length')}
+            if instrument or genre:
+                entry['evidence_note'] = ('MusicBrainz search-tag candidate; '
+                                          'instrumentation is not verified by a recording ID')
             self.searched_recordings[mbid] = entry
-            recordings.append(entry)
-            if len(recordings) >= (20 if target_minutes else 10):
+            found.append(entry)
+            if len(found) >= (20 if self.intent.duration_minutes else 10):
                 break
-        if not recordings:
-            raise ServiceError(
-                "resource",
-                "No MusicBrainz recordings matched the requested artist. "
-                "Try another explicit artist search or discovery source.",
-            )
-        return recordings
+        if not found:
+            raise ServiceError('resource', 'No suitable MusicBrainz recordings found for this query; '
+                               'try a different genre or an identified artist')
+        return found
 
     def tool_search_artists(self, query):
-        if self._is_generic_music_descriptor(query) and not re.search(
-            r'\b(?:artist|musician|band)\s+(?:named|called)\s+', self.goal, re.I
-        ):
-            raise ServiceError(
-                "resource",
-                "Do not search for 'instrumental', 'swing jazz', or other "
-                "style descriptors as artist names. Use a specific artist or "
-                "a genre/tag discovery tool.",
-            )
-        data = self._catalog().search_artist(query)
-        return [{"mbid": x.get("id"), "name": x.get("name"), "score": x.get("score")}
-                for x in data.get("artists", [])[:10]]
+        if not self.intent.artist and (self.intent.instrument or self.intent.genre or
+                                       self._is_generic_music_descriptor(query)):
+            raise ServiceError('resource', 'This request describes an instrument or genre, '
+                               'not an artist name. Use search_recordings (tag search) '
+                               'or lb_radio for discovery.')
+        data = self._catalog().search_artist(self.intent.artist or query)
+        return [{'mbid': x.get('id'), 'name': x.get('name'), 'score': x.get('score')}
+                for x in data.get('artists', [])[:10]]
 
     def tool_lookup_recording(self, mbid):
         item = self._catalog().lookup(mbid)
@@ -627,8 +529,10 @@ class Tools(PlaylistToolsMixin):
             raise ServiceError("invalid", "Playlist title must not be empty")
 
         def title_key(value: str) -> str:
-            bare = re.sub(r"^\[Encore\]\s*", "", str(value).strip(), flags=re.I)
-            return " ".join(bare.casefold().split())
+            bare = str(value).strip()
+            if bare.casefold().startswith('[encore]'):
+                bare = bare[len('[encore]'):].lstrip()
+            return ' '.join(bare.casefold().split())
 
         normalized = title_key(target)
         matches = []
@@ -685,27 +589,19 @@ class Tools(PlaylistToolsMixin):
                 "history_complete": True}
 
     def tool_set_feedback(self, recording_mbid, score):
-        goal = self.goal.casefold()
-        if not re.search(r"\b(love|loved|like|liked|hate|hated|dislike|clear|remove|unlove|unhate|feedback|rating)\b", goal):
-            raise ServiceError("policy_halt", "No explicit feedback instruction in current message")
+        if self.intent.action != 'set_feedback' or not self.intent.explicit:
+            raise ServiceError('policy_halt', 'No explicit feedback instruction')
+        if score != self.intent.feedback_score:
+            raise ServiceError('invalid', 'Proposed score differs from user request')
         mbid = check_uuid(recording_mbid)
-        # Prevent the model choosing a random MBID not tied to the current request.
         if mbid not in self.verified and mbid not in self.searched_recordings:
-            raise ServiceError("invalid", "Search/verify the recording MBID in this session first")
+            raise ServiceError('invalid', 'Search or verify the recording first')
         known = self.verified.get(mbid) or self.searched_recordings.get(mbid) or {}
-        title = known.get("title", "Unknown title")
-        labels = {1: "LOVE", -1: "HATE", 0: "CLEAR"}
-        # Detect contradictions between the requested feedback and proposed score.
-        if re.search(r"\b(?:hate|hated|dislike)\b", goal) and score != -1:
-            raise ServiceError("invalid", "Requested hate feedback requires score=-1")
-        if re.search(r"\b(?:love|loved|like|liked)\b", goal) and score != 1:
-            raise ServiceError("invalid", "Requested love feedback requires score=1")
-        if re.search(r"\b(?:clear|remove|unlove|unhate)\b", goal) and score != 0:
-            raise ServiceError("invalid", "Requested removal of feedback requires score=0")
-        summary = (f"{labels[score]} recording feedback for {title}\n"
-                   f"Recording MBID: {mbid}\nThis modifies your real ListenBrainz feedback.")
-        return self._write("set_feedback", {"recording_mbid": mbid, "score": score},
-                           lambda: self.lb.set_feedback(mbid, score), summary=summary)
+        title = known.get('title') or 'Unknown title'
+        labels = {1: 'LOVE', -1: 'HATE', 0: 'CLEAR'}
+        description = f"{labels[score]} recording feedback for {title}\nRecording MBID: {mbid}"
+        return self._write('set_feedback', {'recording_mbid': mbid, 'score': score},
+                           lambda: self.lb.set_feedback(mbid, score), summary=description)
 
     def tool_export_playlist(self, playlist_mbid, service):
         return self._write("export_playlist", {"playlist_mbid": playlist_mbid, "service": service},
@@ -722,10 +618,12 @@ class Tools(PlaylistToolsMixin):
     def tool_remember_preference(self, key, value, evidence):
         if not evidence or evidence.casefold() not in self.goal.casefold():
             raise ServiceError("policy_halt", "Evidence must occur verbatim in current user message")
-        prefix = self.goal.casefold()
-        if not any(marker in prefix for marker in ("i like", "i prefer", "i dislike", "remember", "don't recommend", "never recommend", "i love", "i hate")):
-            raise ServiceError("policy_halt", "No explicit stable preference in user message")
+        if not self.intent.explicit_preference or self.intent.action != 'remember_preference':
+            raise ServiceError('policy_halt', 'No explicit stable preference in user message')
         self.mem.set_preference(key, value, evidence)
         return {"saved": key}
 
-    def tool_forget_preference(self, key): return {"deleted": self.mem.forget_preference(key)}
+    def tool_forget_preference(self, key):
+        if self.intent.action != 'forget_preference':
+            raise ServiceError('policy_halt', 'User did not ask to forget a preference')
+        return {'deleted': self.mem.forget_preference(key)}

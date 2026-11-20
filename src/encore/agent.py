@@ -3,9 +3,8 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, replace
 from pathlib import Path
-import re
 import json
 import time
 import unicodedata
@@ -22,6 +21,10 @@ from .agent_policies import (
     positive_verification_claim, grounded_popularity_answer,
 )
 from .router import DOMAIN_SCHEMA, DOMAINS, validate_domains, tools_for_domains, TOOL_DOMAIN
+from .request_intent import Intent, interpret, WRITE_TOOLS
+
+# Local preference updates are mutations too; never retry uncertain side effects.
+WRITE_ACTIONS = WRITE_ACTIONS | frozenset(name for group in WRITE_TOOLS.values() for name in group)
 from jsonschema import validate as schema_validate, ValidationError as SchemaValidationError
 
 
@@ -160,47 +163,79 @@ def run_agent(
         },
     ]
 
-    # The model proposes domains; the rule-based gate *still* limits which
-    # account mutations can be executed. On routing failure all domains are
-    # considered, but the intent gate is never bypassed.
-    safety_available = route(goal)
-    selected_domains = tuple(DOMAINS[:-1])
-    router_fallback = True
-    router_meta: dict = {}
+    # Extract structured request constraints once.  Only explicit, schema-validated
+    # intent may authorize side effects.  Missing/broken extraction fails closed.
+    intent = interpret(goal, model)
+    tools.intent = intent
+    if intent.instrument or intent.genre:
+        # The prompt file can override SYSTEM, so reinforce these typed
+        # constraints regardless of which procedural-memory version is loaded.
+        messages.insert(1, {"role": "system", "content": (
+            "Music discovery constraints: instrument=" + json.dumps(intent.instrument) +
+            ", genre=" + json.dumps(intent.genre) + ". "
+            "These are musical categories, NOT named artists or song titles. "
+            "Do not call search_artists for an instrument. For unbound catalog "
+            "discovery use search_recordings with tag-based search or lb_radio. "
+            "MusicBrainz tags are candidate evidence; do not assert audible "
+            "instrumentation without separate verification."
+        )})
+
+    # Domain routing is a separate, real Ollama call.  It narrows read tools,
+    # but cannot authorize a write or revoke a write already validated by the
+    # intent extractor.  Validate mock routers too, not only Ollama responses.
     router_started = time.monotonic()
-    if callable(getattr(model, "route_domains", None)):
-        try:
-            selected_domains, router_meta = model.route_domains(goal)
-            selected_domains = validate_domains({"domains": list(selected_domains)})
-            router_fallback = False
-        except (requests.RequestException, ValueError, TypeError, KeyError, SchemaValidationError):
-            selected_domains = tuple(DOMAINS[:-1])
-    # Infer hard prerequisites from explicit user intent, not model guesses.
-    # This does NOT authorize a write because `route()` already scopes actions.
-    request_text = goal.casefold()
-    mandatory_domains = set()
-    if "playlist" in request_text and re.search(r"\b(?:create|make|build|save|add|remove|delete|export)\b", request_text):
-        mandatory_domains.add("library")
-    if "playlist" not in request_text and re.search(r"\b(?:mark|love|hate|unlove|unhate|clear|rate|thumbs up|thumbs down)\b", request_text) and re.search(r"\b(?:song|track|recording|feedback)\b", request_text):
-        mandatory_domains.update({"library", "catalog"})
-    if "playlist" in request_text and re.search(r"\b(?:create|make|build|save|add)\b", request_text):
-        mandatory_domains.add("catalog")
-    if any(phrase in request_text for phrase in ("previous session", "my preference", "previously", "last time")):
-        mandatory_domains.add("memory")
-    if mandatory_domains:
-        selected_domains = tuple(dict.fromkeys((*(d for d in selected_domains if d != "none"),
-                                               *sorted(mandatory_domains))))
-    elif selected_domains == ("none",) and len(safety_available) < len(SPECS):
-        # A known fact/tool workflow was misclassified as "none".
-        # Fall back to all domains, still subject to the existing intent gate.
-        selected_domains = tuple(DOMAINS[:-1])
+    router_meta: dict = {}
+    router_fallback = False
+    try:
+        if not callable(getattr(model, "route_domains", None)):
+            raise RuntimeError("Model does not implement route_domains")
+        model_domains, router_meta = model.route_domains(goal)
+        selected = validate_domains({"domains": list(model_domains)})
+        router_meta = dict(router_meta)
+    except Exception:
+        selected = tuple(domain for domain in DOMAINS if domain != "none")
+        router_meta = {}
         router_fallback = True
+
+    # A successful intent extraction may identify additional read-only needs
+    # missed by the domain router.  For writes, require their domain and the
+    # necessary catalog verification.  'none' must never hide an explicit write.
+    required_domains = set()
+    if intent.permitted_writes:
+        required_domains.add("library" if intent.action not in {
+            "remember_preference", "forget_preference"} else "memory")
+        if intent.action in {"create_playlist", "add_playlist_tracks", "set_feedback"}:
+            required_domains.add("catalog")
+    if intent.needs_preferences:
+        required_domains.add("memory")
+    # A successfully extracted intent is an independent typed signal for
+    # read-only tool needs. Union it with domain classification so a routing
+    # false-negative cannot silently drop required catalog/discovery tools.
+    # The default fallback Intent() must NOT widen successful domain routing.
+    if intent != Intent():
+        required_domains.update(intent.domains)
+
+    selected_set = (set(selected) - {"none"}) | required_domains
+    selected_domains = tuple(domain for domain in DOMAINS if domain in selected_set)
+    # A deliberately routed 'none' allows final_answer only, unless validated
+    # intent needs another domain.
+    if not selected_domains:
+        selected_domains = ("none",)
+
+    # Tool safety policy is independent from model-selected domains.  Do not
+    # intersect two unreliable classifiers: the domain router decides which
+    # reads are useful; the intent decides which mutations are allowed.
+    safety_intent = replace(intent, domains=tuple(d for d in DOMAINS if d != "none"))
+    safety_available = route(safety_intent)
     available = tools_for_domains(safety_available, selected_domains)
-    # Keep required tools accessible if the classifier missed a domain:
-    # e.g. verified creation always requires catalog verification AND library.
-    if len(available) == 1 and len(safety_available) > 1 and selected_domains != ("none",):
-        available = safety_available
-        router_fallback = True
+    mutations = {name for group in WRITE_TOOLS.values() for name in group}
+    available = [spec for spec in available
+                 if spec["function"]["name"] not in mutations
+                 or spec["function"]["name"] in intent.permitted_writes]
+    if (intent.instrument or intent.genre) and not intent.artist:
+        # A bare instrument or style cannot be looked up as an artist.
+        available = [spec for spec in available
+                     if spec["function"]["name"] != "search_artists"]
 
     prompt_tokens = int(router_meta.get("tokens_in") or 0)
     generated_tokens = int(router_meta.get("tokens_out") or 0)
@@ -272,13 +307,7 @@ def run_agent(
     # An incomplete edit should not terminate on the model's first
     # premature final_answer. Recovery is bounded by this counter.
     premature_edit_finals = 0
-    edit_requested = (
-        "playlist" in goal.casefold()
-        and bool(re.search(
-            r"\b(?:add|adding|append|appending|insert|inserting)\b",
-            goal, re.I,
-        ))
-    )
+    edit_requested = intent.action == 'add_playlist_tracks'
     edit_tool_names = {"add_playlist_tracks", "add_playlist_items"}
 
     # Episodic recall is a session-initialization read, not a model action.
@@ -323,10 +352,7 @@ def run_agent(
     # Session-start retrieval: saved preferences are data, not executable rules.
     # The memory read consumes one action in the bounded budget and is traced.
     low_goal = goal.casefold()
-    needs_prior_preferences = any(term in low_goal for term in (
-        "my preference", "my music preference", "previously", "told you",
-        "what i like", "based on my", "last time", "studying",
-    ))
+    needs_prior_preferences = intent.needs_preferences
     first_model_step = 1
     prior_preferences = []
     if needs_prior_preferences:
@@ -548,14 +574,8 @@ def run_agent(
             # evidence of a write. Keep the tool choices available instead of
             # forcing final_answer before create_playlist is called.
             creation_pending = (
-                "playlist" in low_goal
-                and not edit_requested
-                and bool(re.search(r"\b(create|make|build|save)\b", low_goal))
-                and not bool(re.search(
-                    r"\b(?:do not|don't|dont|never|without)\s+"
-                    r"(?:create|make|build|save)\b", low_goal,
-                ))
-                and not any(t.get("tool") == "create_playlist" and t.get("ok") for t in trace)
+                intent.action == 'create_playlist'
+                and not any(t.get('tool') == 'create_playlist' and t.get('ok') for t in trace)
             )
             if creation_pending:
                 verified_options = [
@@ -772,16 +792,7 @@ def run_agent(
             # A successful catalog lookup is not a successful account write.
             # Negated instructions such as "Do not create a new playlist"
             # must not be interpreted as a requested account creation.
-            negated_create = re.search(
-                r"\b(?:do not|don't|dont|never|without)\s+"
-                r"(?:(?:want|need)\s+to\s+)?(?:create|make|build|save)\b",
-                low_goal,
-            )
-            requested_create = (
-                "playlist" in low_goal
-                and bool(re.search(r"\b(?:create|make|build|save)\b", low_goal))
-                and not bool(negated_create)
-            )
+            requested_create = intent.action == 'create_playlist'
             if requested_create and proposed_status == "answered":
                 attempts = [t for t in trace if t.get("tool") == "create_playlist"]
                 completed = [t for t in attempts if t.get("ok")]
@@ -802,17 +813,11 @@ def run_agent(
             # Edits are complete only when the corresponding API write was
             # observed AND its readback matched. A listing with track:[]
             # does not prove a playlist is empty.
-            requested_edit = None
-            if "playlist" in low_goal and re.search(
-                r"\b(?:add|adding|append|appending|insert|inserting)\b",
-                low_goal,
-            ):
-                requested_edit = {"add_playlist_tracks", "add_playlist_items"}
-            elif "playlist" in low_goal and re.search(r"\b(remove|delete)\b", low_goal):
-                if not re.search(r"\b(?:song|track|recording|item)\b", low_goal):
-                    requested_edit = {"delete_playlist"}
-                else:
-                    requested_edit = {"remove_playlist_tracks", "remove_playlist_items"}
+            requested_edit = {
+                'add_playlist_tracks': {'add_playlist_tracks', 'add_playlist_items'},
+                'remove_playlist_tracks': {'remove_playlist_tracks', 'remove_playlist_items'},
+                'delete_playlist': {'delete_playlist'},
+            }.get(intent.action)
             if requested_edit and proposed_status == "answered":
                 completed = [entry for entry in trace
                              if entry.get("tool") in requested_edit and entry.get("ok")]
@@ -826,10 +831,7 @@ def run_agent(
                                         "could not be confirmed by readback. Reconcile the remote "
                                         "playlist before attempting another edit.")
 
-            if (re.search(r"\b(?:mark|set|love|hate|unlove|unhate|clear|remove|rate)\b", low_goal)
-                    and re.search(r"\b(?:song|track|recording|feedback|this)\b", low_goal)
-                    and proposed_status == "answered"):
-
+            if intent.action == 'set_feedback' and proposed_status == 'answered':
                 if not any(t.get("tool") == "set_feedback" and t.get("ok") for t in trace):
                     proposed_status = "stuck"
                     proposed_answer = "Recording feedback was not changed: no successful set_feedback call occurred."
@@ -838,10 +840,10 @@ def run_agent(
             # has vocals. Never mark an instrumental-only requirement as fully
             # answered unless our tool data explicitly supports that property.
             instrumental_constraint = (
-                "instrumental" in low_goal
+                intent.instrumental_only
                 or any("instrumental" in p["value"].casefold()
                        for p in prior_preferences)
-            ) and any(t in low_goal for t in ("song", "music", "track", "recommend"))
+            )
             if instrumental_constraint and proposed_status == "answered":
                 proposed_status = "answered_low_confidence"
                 if not any(t in proposed_answer.casefold() for t in (
@@ -867,7 +869,7 @@ def run_agent(
             )
 
             grounding_error = _answer_grounding_error(
-                goal,
+                intent,
                 proposed_answer,
                 proposed_status,
                 grounded_candidates,
@@ -1013,7 +1015,7 @@ def run_agent(
                           tokens_in=usage["tokens_in"], tokens_out=usage["tokens_out"],
                           latency_ms=round((time.monotonic()-final_started)*1000))
                     if (reviewed["status"] == proposed_status
-                        and not _answer_grounding_error(goal, reviewed["answer"], proposed_status,
+                        and not _answer_grounding_error(intent, reviewed["answer"], proposed_status,
                                 grounded_candidates, verified_mbids,
                                 positive_verification_claim(reviewed["answer"]))
                         and not (positive_verification_claim(reviewed["answer"]) and not did_verify)):
@@ -1107,6 +1109,11 @@ def run_agent(
                     or name in WRITE_ACTIONS or attempt >= max_read_attempts):
                 break
             delay_used = min(8.0, 2 ** (attempt - 1)) + retry_rng.uniform(0, 0.25)
+            # MusicBrainz can use HTTP 503 for IP/global throttling, not just
+            # server failure. Give it a meaningful cooldown before the next
+            # read attempt; keep all write actions strictly non-retryable.
+            if outcome.message and ('HTTP 503' in outcome.message or 'HTTP 429' in outcome.message):
+                delay_used = max(delay_used, min(20.0, 5.0 * attempt))
             _emit("retry", step=step, tool=name, attempt=attempt,
                   next_attempt=attempt + 1, error_category="transient",
                   delay_s=round(delay_used, 3),
@@ -1230,7 +1237,7 @@ def run_agent(
         # episodic context and malformed final_answer arguments from turning
         # a successful 2-song read into a bogus 20-track playlist diagnosis.
         if outcome.ok and name == "get_top_recordings_for_artist":
-            popularity = grounded_popularity_answer(goal, outcome.data)
+            popularity = grounded_popularity_answer(intent, outcome.data)
             if popularity is not None:
                 answer, final_sources = popularity
                 status = "answered"
@@ -1258,11 +1265,7 @@ def run_agent(
 
         if name == "create_playlist" and not outcome.ok and outcome.error_type == "invalid":
             # Precise recovery instructions after invalid model arguments.
-            match = re.search(
-                r"\b(?:called|named)\s+(.+?)\s+(?:with|containing)\s+\d+\b",
-                goal, re.I,
-            )
-            requested_title = match.group(1).strip() if match else None
+            requested_title = intent.playlist_name
             options = [
                 {"mbid": mid, "title": value.get("title")}
                 for mid, value in tools.verified.items()
@@ -1285,7 +1288,7 @@ def run_agent(
         # REINJECT THE ORIGINAL DISCOVERY GOAL
         # ----------------------------------------------------
 
-        needed = requested_discovery_count(goal)
+        needed = requested_discovery_count(intent)
 
         if (
             outcome.ok
@@ -1376,10 +1379,7 @@ def run_agent(
     # A missed final_answer must not erase a useful, verified diagnosis.
     # A failed create never counts as successful, even if the LLM printed
     # a natural-language success claim.
-    if status == "budget_exceeded" and re.search(
-        r"\b(?:create|make|build|save)\b.*\bplaylist\b",
-        goal, re.I,
-    ):
+    if status == 'budget_exceeded' and intent.action == 'create_playlist':
         created = any(
             event.get("tool") == "create_playlist" and event.get("ok")
             for event in trace

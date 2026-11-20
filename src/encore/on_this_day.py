@@ -10,9 +10,11 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+from collections import Counter
 from datetime import datetime
+from typing import Callable
 import json
-import re
+import requests
 import sys
 import time
 from pathlib import Path
@@ -38,14 +40,8 @@ ALLOW = {
         "Do not use this to infer a calendar date that the source doesn't state."
     ),
 }
-MUSIC_WORDS = re.compile(
-    r"\b(singer|songwriter|musician|composer|guitarist|pianist|drummer|rapper|"
-    r"record producer|vocalist|violinist|saxophonist|trumpeter|clarinetist|"
-    r"bassist|bandleader|conductor|cellist|organist|flutist|keyboardist|"
-    r"multi-instrumentalist|jazz|soprano|tenor|mezzo-soprano|disc jockey|dj)\b",
-    re.IGNORECASE,
-)
-BIRTH_LINE = re.compile(r"^\s*(\d{3,4})\s*[–—-]\s*(.+)$")
+# Artist identity and music relevance are extracted with Ollama JSON schema,
+# not inferred from Wikipedia's variable punctuation or occupation wording.
 
 
 def event_day(raw: str | None, timezone: str) -> tuple[int, int]:
@@ -54,8 +50,8 @@ def event_day(raw: str | None, timezone: str) -> tuple[int, int]:
         now = datetime.now(ZoneInfo(timezone))
         return now.month, now.day
     try:
-        if re.fullmatch(r"\d{2}-\d{2}", raw):
-            dt = datetime.strptime("2000-" + raw, "%Y-%m-%d")
+        if len(raw) == 5 and raw[2] == '-':
+            dt = datetime.strptime('2000-' + raw, '%Y-%m-%d')
         else:
             dt = datetime.strptime(raw, "%Y-%m-%d")
         return dt.month, dt.day
@@ -64,46 +60,97 @@ def event_day(raw: str | None, timezone: str) -> tuple[int, int]:
 
 
 def normalize(name: str) -> str:
-    return re.sub(r"[^\w]+", "", name.casefold())
+    return ''.join(ch for ch in name.casefold() if ch.isalnum())
 
 
 def date_title(month: int, day: int) -> str:
     return datetime(2000, month, day).strftime("%B") + f" {day}"
 
 
-def birth_candidates(sections: list[dict], *, max_candidates: int = 40) -> list[dict]:
-    """Take only musicians explicitly listed under Wikipedia's Births heading."""
-    births = []
-    seen = set()
+def birth_candidates(sections: list[dict], *, cfg, max_candidates: int = 40) -> list[dict]:
+    """Extract musician birthdays from Wikipedia with constrained Ollama JSON.
 
-    def walk(nodes: list[dict], in_births: bool = False):
+    Candidates are not facts until MusicBrainz confirms the full date.
+    Each claimed line must appear verbatim in the Wikipedia section.
+    """
+    lines = []
+
+    def collect(nodes, under_births=False):
         for section in nodes:
-            title = str(section.get("title", ""))
-            under_births = in_births or title.casefold() == "births"
-            if under_births:
-                for line in str(section.get("text", "")).splitlines():
-                    found = BIRTH_LINE.match(line)
-                    if not found or not MUSIC_WORDS.search(found.group(2)):
-                        continue
-                    year, detail = found.groups()
-                    # Calendar-date pages typically say "YEAR – Person, occupation".
-                    # Ignore entries lacking a comma; we can't parse the name safely.
-                    if "," not in detail:
-                        continue
-                    artist = detail.split(",", 1)[0].strip().strip("* ")
-                    if not artist or normalize(artist) in seen:
-                        continue
-                    seen.add(normalize(artist))
-                    births.append({"artist": artist, "birth_year": int(year),
-                                   "statement": line.strip()[:500]})
-                    if len(births) >= max_candidates:
-                        return
-            walk(section.get("sections") or [], under_births)
-            if len(births) >= max_candidates:
-                return
+            births = under_births or str(section.get('title', '')).casefold() == 'births'
+            if births:
+                lines.extend(str(section.get('text', '')).splitlines())
+            collect(section.get('sections') or [], births)
 
-    walk(sections)
-    return births
+    collect(sections)
+    lines = [line.strip() for line in lines if line.strip()]
+    if not lines:
+        return []
+    schema = {
+        'type': 'object', 'additionalProperties': False,
+        'properties': {
+            'births': {
+                'type': 'array', 'maxItems': 40,
+                'items': {
+                    'type': 'object', 'additionalProperties': False,
+                    'properties': {
+                        'artist': {'type': 'string'},
+                        'birth_year': {'type': 'integer', 'minimum': 1000, 'maximum': 2100},
+                        'statement': {'type': 'string'},
+                    },
+                    'required': ['artist', 'birth_year', 'statement'],
+                },
+            }
+        },
+        'required': ['births'],
+    }
+    extracted = []
+    seen = set()
+    # Bounded chunks keep local Ollama within reasonable context budgets.
+    for start in range(0, len(lines), 45):
+        segment = lines[start:start+45]
+        response = requests.post(
+            f'{cfg.ollama_host.rstrip("/")}/api/chat',
+            json={
+                'model': cfg.model,
+                'messages': [
+                    {'role': 'system', 'content': (
+                        'Extract only actual musician, singer, songwriter, instrumentalist, '
+                        'composer, or music-producer BIRTH entries in the given Wikipedia '
+                        'Births section. Each output statement MUST be copied exactly from '
+                        'one supplied line. Provide the named person, their birth year, '
+                        'and the complete original line. Exclude actors without a music role '
+                        'and exclude deaths or unrelated events. Return only valid JSON.'
+                    )},
+                    {'role': 'user', 'content': json.dumps(segment, ensure_ascii=False)},
+                ],
+                'format': schema, 'stream': False, 'think': False,
+                'options': {'temperature': 0, 'num_predict': 1200},
+            },
+            timeout=(5, 150),
+        )
+        response.raise_for_status()
+        data = json.loads((response.json().get('message') or {}).get('content') or '{}')
+        for row in data.get('births', []):
+            if not isinstance(row, dict):
+                continue
+            artist, year, statement = (row.get('artist'), row.get('birth_year'),
+                                       row.get('statement'))
+            if not isinstance(artist, str) or not artist.strip():
+                continue
+            if not isinstance(year, int) or isinstance(year, bool):
+                continue
+            if statement not in segment or str(year) not in statement:
+                continue
+            key = normalize(artist)
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            extracted.append({'artist': artist.strip(), 'birth_year': year,
+                              'statement': statement[:500]})
+            if len(extracted) >= max_candidates:
+                return extracted
+    return extracted
 
 
 def unpack_mcp_result(result) -> dict:
@@ -201,55 +248,109 @@ def credited_to(recording: dict, artist_id: str) -> bool:
     return False
 
 
-def match_birthday(mb: MusicBrainz, candidate: dict, month: int, day: int) -> dict | None:
-    """Both name and full birth date must agree with the Wikipedia candidate."""
-    response = mb.search_artist(candidate["artist"], limit=5)
+def match_birthday(mb: MusicBrainz, candidate: dict, month: int, day: int,
+                   *, report: Callable[[str, str], None] | None = None) -> dict | None:
+    """Require Wikipedia's birth year, MB full birthdate, and a real recording.
+
+    `report` makes every verification failure visible instead of returning None
+    silently. Search API recording results may omit artist credit, so verify the
+    recording's full lookup result before accepting or rejecting that credit.
+    """
+    def note(reason: str, detail: str = "") -> None:
+        if report is not None:
+            report(reason, detail)
+
+    artists = mb.search_artist(candidate["artist"], limit=10).get("artists", [])
     expected = f"{candidate['birth_year']:04d}-{month:02d}-{day:02d}"
-    for artist in response.get("artists", []):
-        if normalize(str(artist.get("name", ""))) != normalize(candidate["artist"]):
+    normalized = normalize(candidate["artist"])
+    exact_name = [artist for artist in artists
+                  if normalize(str(artist.get("name", ""))) == normalized]
+    if not exact_name:
+        note("artist_name_not_found", "No exact artist name in MusicBrainz results")
+        return None
+
+    dated_artists = [artist for artist in exact_name
+                     if (artist.get("life-span") or {}).get("begin") == expected]
+    if not dated_artists:
+        found_dates = sorted({str((a.get("life-span") or {}).get("begin") or "missing")
+                              for a in exact_name})
+        note("birthdate_not_verified", f"Expected {expected}; MusicBrainz dates: {found_dates}")
+        return None
+
+    for artist in dated_artists:
+        artist_id = artist.get("id")
+        if not artist_id:
             continue
-        if (artist.get("life-span") or {}).get("begin") != expected:
+        # arid: searches the recording credit's MusicBrainz artist identifier.
+        tracks = mb.search(f"arid:{artist_id}", limit=12).get("recordings", [])
+        if not tracks:
+            note("no_recordings", "No indexed recordings for verified artist")
             continue
-        # Search by MB artist ID; do not pick a recording by fuzzy title alone.
-        artist_id = artist["id"]
-        tracks = mb.search(f"arid:{artist_id}", limit=8).get("recordings", [])
         for track in tracks:
-            if not credited_to(track, artist_id) or not track.get("id"):
+            recording_id = track.get("id")
+            if not recording_id:
                 continue
-            verified = mb.lookup(track["id"])
+            # Recording search responses can have incomplete artist-credit data.
+            # The detail lookup, not the search hit, is our source of truth.
+            verified = mb.lookup(recording_id)
             if not credited_to(verified, artist_id):
                 continue
+            if not verified.get("id") or not verified.get("title"):
+                continue
+            note("verified", f"{artist['name']} - {verified['title']}")
             return {
                 "artist": artist["name"],
                 "artist_mbid": artist_id,
                 "birth_date": expected,
-                "track": verified.get("title", track.get("title", "")),
+                "track": verified["title"],
                 "recording_mbid": verified["id"],
                 "musicbrainz_url": f"https://musicbrainz.org/recording/{verified['id']}",
                 "artist_musicbrainz_url": f"https://musicbrainz.org/artist/{artist_id}",
             }
+    note("recording_credit_not_verified", "No returned recording credited to the artist")
     return None
 
 
 def build_shortlist(mb: MusicBrainz, candidates: list[dict], month: int, day: int,
                     *, count: int, scan: int, liked: set[str],
-                    trace: SessionTrace, title: str) -> list[dict]:
-    # Prioritize *exact* listening-history artist matches, don't invent taste similarity.
-    ordered = sorted(candidates, key=lambda x: normalize(x["artist"]) not in liked)
+                    trace: SessionTrace, title: str,
+                    diagnostics: list[dict] | None = None, debug: bool = False) -> list[dict]:
+    # Give known favorites priority, then newer birthdays. Previously, scanning
+    # the oldest first could exhaust --scan before reaching modern musicians.
+    ordered = sorted(candidates, key=lambda x: (
+        normalize(x["artist"]) not in liked, -x["birth_year"]
+    ))
     results: list[dict] = []
     for candidate in ordered[:scan]:
+        checks: list[tuple[str, str]] = []
+
+        def note(reason: str, detail: str = "") -> None:
+            checks.append((reason, detail))
+
         try:
-            found = match_birthday(mb, candidate, month, day)
+            found = match_birthday(mb, candidate, month, day, report=note)
         except ServiceError as exc:
-            trace.emit("musicbrainz_lookup", artist=candidate["artist"],
-                       status="error", error_category=exc.kind)
-            continue
+            found = None
+            note("musicbrainz_error", f"{exc.kind}: {exc}")
+        except (KeyError, ValueError, TypeError) as exc:
+            found = None
+            note("unexpected_response", f"{type(exc).__name__}: {exc}")
+
+        reason, detail = checks[-1] if checks else ("unknown_failure", "No diagnostic")
+        entry = {"artist": candidate["artist"], "birth_year": candidate["birth_year"],
+                 "status": reason, "detail": detail[:250]}
+        if diagnostics is not None:
+            diagnostics.append(entry)
+        trace.emit("birthday_verification", artist=candidate["artist"],
+                   birth_year=candidate["birth_year"], passed=bool(found),
+                   reason=reason, detail=detail[:250],
+                   artist_mbid=found.get("artist_mbid") if found else None)
+        if debug:
+            print(f"[MusicBrainz] {candidate['artist']} ({candidate['birth_year']}): "
+                  f"{reason}" + (f" — {detail}" if detail else ""), file=sys.stderr)
         if not found:
-            trace.emit("birthday_verification", artist=candidate["artist"],
-                       passed=False)
             continue
-        trace.emit("birthday_verification", artist=candidate["artist"], passed=True,
-                   artist_mbid=found["artist_mbid"], date=found["birth_date"])
+
         found.update({
             "reason": f"Born on {title} in {candidate['birth_year']} (Wikipedia and MusicBrainz agree).",
             "wikipedia_statement": candidate["statement"],
@@ -306,10 +407,10 @@ async def run(args: argparse.Namespace) -> dict:
                             "server": wiki.server_name, "version": wiki.server_version,
                             "protocol": wiki.protocol}
                 response = await wiki.call("get_sections", {"title": title})
-        candidates = birth_candidates(response.get("sections") or [])
+        candidates = birth_candidates(response.get("sections") or [], cfg=cfg)
         trace.emit("candidate_extraction", count=len(candidates), page=title)
         if not candidates:
-            return {"date": title, "items": [], "note": "No parseable musician birthdays on the date page."}
+            return {"date": title, "items": [], "note": "No musician birthdays could be extracted and grounded from Wikipedia."}
         http = Http("Encore-OnThisDay/0.1 (" + cfg.mb_contact + ")",
                     reporter=trace.emit)
         mb = MusicBrainz(http, cfg.mb_contact)
@@ -325,13 +426,23 @@ async def run(args: argparse.Namespace) -> dict:
                 taste_note = "Prioritized artists in ListenBrainz all-time top artists (exact matches)."
             except ServiceError as exc:
                 trace.emit("taste_lookup", status="error", error_category=exc.kind)
+        diagnostics: list[dict] = []
+        if args.debug:
+            print(f"[Wikipedia] {len(candidates)} musician candidates on {title}; "
+                  f"checking at most {args.scan}", file=sys.stderr)
         items = build_shortlist(mb, candidates, month, day,
                                 count=args.limit, scan=args.scan, liked=liked,
-                                trace=trace, title=title)
+                                trace=trace, title=title,
+                                diagnostics=diagnostics, debug=args.debug)
         report = {
             "date": title, "theme": "Musician birthdays",
             "items": items, "taste_note": taste_note,
             "matched": len(items), "candidates_discovered": len(candidates),
+            "verification": {
+                "checked": len(diagnostics),
+                "outcomes": dict(Counter(d["status"] for d in diagnostics)),
+                "details": diagnostics if args.debug or not items else [],
+            },
             "note": "Read-only draft: not saved to ListenBrainz, not an actual playlist.",
             "trace": str(trace.path),
         }
@@ -354,6 +465,7 @@ def main() -> None:
     parser.add_argument("--output", type=Path, help="Optional JSON output path")
     parser.add_argument("--list-tools", action="store_true", help="Show discovered allowlisted MCP tool schemas")
     parser.add_argument("--narrate", action="store_true", help="Optional sourced introduction via local Ollama")
+    parser.add_argument("--debug", action="store_true", help="Show why each MusicBrainz candidate passed or failed")
     args = parser.parse_args()
     if not 1 <= args.limit <= 10 or not 1 <= args.scan <= 40 or args.timeout <= 0:
         parser.error("limit must be 1..10; scan 1..40; timeout positive")

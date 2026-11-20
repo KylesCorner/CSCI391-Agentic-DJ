@@ -9,7 +9,6 @@ from datetime import datetime, timedelta, timezone
 import json
 import math
 from pathlib import Path
-import re
 from uuid import uuid4
 
 import requests
@@ -55,9 +54,10 @@ def _text(summary: dict) -> str:
 def _strip_secrets(s: str, secrets: tuple[str, ...] = ()) -> str:
     for secret in secrets:
         if secret:
-            s = s.replace(secret, "[REDACTED]")
-    s = re.sub(r"(?i)(authorization\s*:\s*token\s+)\S+", r"\1[REDACTED]", s)
-    return s
+            s = s.replace(secret, '[REDACTED]')
+    # Drop entire free-form lines containing raw Authorization tokens.
+    return '\n'.join('[REDACTED AUTH HEADER]' if 'authorization' in line.casefold()
+                     else line for line in s.split('\n'))
 
 
 class OllamaEmbedder:
@@ -162,18 +162,24 @@ class SessionSummarizer:
             and item.get("ok") and item.get("confirmed")
             for item in safe_events
         )
-        any_write_assertion = any(re.search(
-            r"\b(created|added|removed|exported|deleted)\b.{0,100}\bplaylist\b|"
-            r"\bplaylist\b.{0,100}\b(created|added|removed|exported|deleted)\b",
-            statement, re.IGNORECASE
-        ) for statement in summary["decisions"])
+        def words(value: str) -> list[str]:
+            return ''.join(ch.casefold() if ch.isalpha() else ' ' for ch in value).split()
+
+        any_write_assertion = any(
+            'playlist' in words(statement)
+            and any(term in words(statement) for term in
+                    ('created', 'added', 'removed', 'exported', 'deleted'))
+            for statement in summary['decisions']
+        )
         if any_write_assertion and not successful_writes:
             review = {"consistent": False, "score": min(float(review["score"]), 0.25),
                       "issues": list(review["issues"]) + ["No confirmed matching playlist write in tool trace"]}
-        explicitly_stated_preference = re.search(
-            r"\b(i prefer|i like|i love|i dislike|i hate|remember that i|"
-            r"don't recommend|never recommend)\b", goal, re.IGNORECASE,
+        stated_preferences = (
+            'i prefer', 'i like', 'i love', 'i dislike', 'i hate',
+            'remember that i', "don't recommend", 'never recommend'
         )
+        explicitly_stated_preference = any(phrase in goal.casefold()
+                                           for phrase in stated_preferences)
         if summary["preferences"] and not explicitly_stated_preference:
             review = {"consistent": False, "score": min(float(review["score"]), 0.25),
                       "issues": list(review["issues"]) + ["User did not explicitly state a new preference"]}

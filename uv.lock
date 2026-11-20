@@ -873,6 +873,7 @@ dependencies = [
     { name = "mcp" },
     { name = "python-dotenv" },
     { name = "requests" },
+    { name = "rich" },
     { name = "wikipedia-mcp" },
     { name = "ytmusicapi" },
 ]
@@ -890,6 +891,7 @@ requires-dist = [
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8,<10" },
     { name = "python-dotenv", specifier = ">=1.0,<2" },
     { name = "requests", specifier = ">=2.32,<3" },
+    { name = "rich", specifier = ">=15.0.0" },
     { name = "wikipedia-mcp", specifier = "==2.0.1" },
     { name = "ytmusicapi", specifier = ">=1.12.3" },
 ]
